@@ -12,6 +12,10 @@ UnderwaterAcoustics = "0efb1f7a-1ce7-46d2-9f48-546a4c8fbb99"
 
 [compat]
 julia = "1.6"
+Optim = "1.6"
+ForwardDiff = "0.10"
+OrdinaryDiffEq = "6.9"
+UnderwaterAcoustics = "0.2"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
