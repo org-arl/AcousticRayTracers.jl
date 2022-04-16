@@ -1,0 +1,13 @@
+name = "RaySolver"
+uuid = "4fc4fbda-03ee-4929-b565-b3d9b12bdf79"
+authors = ["Mandar Chitre <mandar@nus.edu.sg>"]
+version = "0.1.0"
+
+[compat]
+julia = "1.6"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
