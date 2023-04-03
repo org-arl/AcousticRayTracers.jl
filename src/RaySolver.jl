@@ -285,7 +285,7 @@ function traceray(model::RaySolver, tx1::AcousticSource, θ::Real, rmax, ds=0.0;
     if abs(θ) ≥ π/2
       break
     end
-    if abs(A)/q < model.athreshold
+    if abs(A)/abs(q) < model.athreshold
       break
     end
   end
