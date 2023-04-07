@@ -152,7 +152,7 @@ function UnderwaterAcoustics.transfercoef(model::RaySolver, tx1::AcousticSource,
           A *= cis(-π/2 * kmah)                       # COA section 3.4.1 (KMAH correction)
           W = abs(q * δθ)                             # COA (3.74)
           A *= exp(-(n / W)^2)
-          tc[j, i, Threads.threadid()] += mode === :coherent ? conj(A) * cis(-ω * t) : Complex(abs2(A), 0.0)
+          tc[j, i, Threads.threadid()] += mode === :coherent ? conj(A) * cis(ω * t) : Complex(abs2(A), 0.0)
         end
       end
     end)
