@@ -5,8 +5,8 @@
 # AcousticRayTracers
 
 `RaySolver` is a differentiable 2½D Gaussian beam tracer for use with [`UnderwaterAcoustics.jl`](https://github.com/org-arl/UnderwaterAcoustics.jl).
-It is similar to [Bellhop](http://oalib.hlsresearch.com/AcousticsToolbox/), but fully written in Julia to be compatible with automatic differentiation
-tool such as `ForwardDiff`, `ReverseDiff` and `Zygote`, and other tools including `Turing`, `Measurements`, etc.
+It is similar to [Bellhop](http://oalib.hlsresearch.com/AcousticsToolbox/), but fully written in Julia to be compatible with automatic differentiation (AD)
+tool such as `ForwardDiff` (compatibility with other AD packages such as `ReverseDiff` and `Zygote` is not fully tested).
 
 ---
 
