@@ -8,8 +8,6 @@
 It is similar to [Bellhop](http://oalib.hlsresearch.com/AcousticsToolbox/), but fully written in Julia to be compatible with automatic differentiation
 tool such as `ForwardDiff`, `ReverseDiff` and `Zygote`, and other tools including `Turing`, `Measurements`, etc.
 
-NOTE: The `RaySolver` model is experimental and being actively developed, and should be considered as a **beta release** at present. Feedback and bug reports are welcome.
-
 ---
 
 ## Installation
