@@ -65,12 +65,12 @@ function UnderwaterAcoustics.eigenrays(model::RaySolver, tx1::AcousticSource, rx
   end
   θ = range(model.minangle, model.maxangle; length=nbeams)
   n = length(θ)
-  rmax = ForwardDiff.value(p2[1])
-  err = fill(NaN64, n)
+  rmax = p2[1]
+  err = fill(convert(eltype(p2), NaN64), n)
   Threads.@threads for i ∈ 1:n
     p3 = traceray(model, tx1, θ[i], rmax).raypath[end]
     if isapprox(p3[1], p2[1]; atol=model.atol) && isapprox(p3[2], p2[2]; atol=model.atol)
-      err[i] = ForwardDiff.value(p3[3] - p2[3])
+      err[i] = p3[3] - p2[3]
     end
   end
   T = promote_type(envrealtype(model.env), eltype(location(tx1)), typeof(nominalfrequency(tx1)), eltype(location(rx1)))
