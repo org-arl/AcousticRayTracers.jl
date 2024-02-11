@@ -224,7 +224,7 @@ function traceray1(T, model, r0, z0, θ, rmax, ds, p0, q0)
   else
     soln = solve(prob, model.solver; abstol=model.solvertol, saveat=ds, callback=cb)
   end
-  s2 = soln[end]
+  s2 = soln.u[end]
   soln.t[end], s2[1], s2[2], atan(s2[4], s2[3]), s2[5], s2[6], s2[7], soln.u, soln.t
 end
 
