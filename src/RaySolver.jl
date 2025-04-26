@@ -1,146 +1,139 @@
-using LinearAlgebra
-using OrdinaryDiffEq
-using ForwardDiff
-using Optim
+import LinearAlgebra: norm, dot
+import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, Rodas5, solve, terminate!
+import ForwardDiff: derivative
+import NonlinearSolve: IntervalNonlinearProblem
+import NonlinearSolve.SciMLBase: successful_retcode
 
-"""
-A pure Julia implementation of a ray/Gaussian beam propapagation model. The model supports complex
-environments, but retains differentiability.
-"""
-Base.@kwdef struct RaySolver{T1,T2} <: PropagationModel{T1}
+Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   env::T1
   nbeams::Int = 0
-  minangle::Float64 = -80°
-  maxangle::Float64 = +80°
+  min_angle::Float64 = -deg2rad(80)
+  max_angle::Float64 = +deg2rad(80)
   ds::Float64 = 1.0
   atol::Float64 = 1e-4
   rugosity::Float64 = 1.5
-  athreshold::Float64 = 1e-5
-  solver::T2 = missing
-  solvertol::Float64 = 1e-4
-  function RaySolver(env, nbeams, minangle, maxangle, ds, atol, rugosity, athreshold, solver, solvertol)
+  min_amplitude::Float64 = 1e-5
+  solver::T2 = nothing
+  solver_tol::Float64 = 1e-4
+  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
     nbeams < 0 && (nbeams = 0)
-    -π/2 ≤ minangle ≤ π/2 || throw(ArgumentError("minangle should be between -π/2 and π/2"))
-    -π/2 ≤ maxangle ≤ π/2 || throw(ArgumentError("maxangle should be between -π/2 and π/2"))
-    minangle < maxangle || throw(ArgumentError("maxangle should be more than minangle"))
-    if solver === missing
-      if ssp(env) isa IsoSSP || (ssp(env) isa SampledSSP && length(ssp(env).z) ≤ 2)
-        solver = Tsit5()
-      else
-        solver = Rodas5()
-      end
-    end
-    new{typeof(env),typeof(solver)}(check(RaySolver, env), nbeams, minangle, maxangle, ds, atol, rugosity, athreshold, solver, solvertol)
+    -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
+    -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
+    min_angle < max_angle || error("max_angle should be more than min_angle")
+    solver = something(solver, is_isovelocity(env) ? Tsit5() : Rodas5())
+    new{typeof(env),typeof(solver)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
   end
 end
 
 """
-    RaySolver(env; nbeams, minangle, maxangle, ds, atol, rugosity, athreshold, solver, solvertol)
+    RaySolver(env; kwargs...)
 
-Create a RaySolver propagation model.
+Julia implementation of a ray/Gaussian beam propagation model. The model supports
+complex environments, but retains differentiability.
+
+Supported keyword arguments:
+- `nbeams`: number of beams to use (default: 0, auto)
+- `min_angle`: minimum beam angle (default: -80°)
+- `max_angle`: maximum beam angle (default: 80°)
+- `ds`: nominal spacing between ray points (default: 1 m)
+- `atol`: absolute position tolerance (default: 0.0001 m)
+- `rugosity`: rugosity of the seabed (default: 1.5 m)
+- `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
+- `solver`: differential equation solver (default: nothing, auto)
+- `solver_tol`: solver tolerance (default: 1e-4)
 """
 RaySolver(env; kwargs...) = RaySolver(; env=env, kwargs...)
 
+Base.show(io::IO, pm::RaySolver) = print(io, "RaySolver(⋯)")
+
 ### interface functions
 
-function UnderwaterAcoustics.check(::Type{RaySolver}, env::Union{<:UnderwaterEnvironment,Missing})
-  env
-end
-
-function UnderwaterAcoustics.arrivals(model::RaySolver, tx1::AcousticSource, rx1::AcousticReceiver)
-  check2d([tx1], [rx1])
-  a = [RayArrival(r.time, r.phasor, r.surface, r.bottom, r.launchangle, r.arrivalangle) for r ∈ eigenrays(model, tx1, rx1; ds=0.0)]
-  sort(a; by = a1 -> a1.time)
-end
-
-function UnderwaterAcoustics.eigenrays(model::RaySolver, tx1::AcousticSource, rx1::AcousticReceiver; ds=model.ds)
-  check2d([tx1], [rx1])
-  p2 = location(rx1)
-  nbeams = model.nbeams
+function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver)
+  _check2d([tx], [rx])
+  p2 = location(rx)
+  nbeams = pm.nbeams
   if nbeams == 0
-    p1 = location(tx1)
-    R = abs(p2[1] - p1[1])
-    h = maxdepth(bathymetry(model.env))
-    nbeams = ceil(Int, 16 * (model.maxangle - model.minangle) / atan(h, R))
+    p1 = location(tx)
+    R = abs(p2.x - p1.x)
+    h = maximum(pm.env.bathymetry)
+    nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
-  θ = range(model.minangle, model.maxangle; length=nbeams)
-  n = length(θ)
-  rmax = p2[1]
-  err = fill(convert(eltype(p2), NaN64), n)
-  Threads.@threads for i ∈ 1:n
-    p3 = traceray(model, tx1, θ[i], rmax).raypath[end]
-    if isapprox(p3[1], p2[1]; atol=model.atol) && isapprox(p3[2], p2[2]; atol=model.atol)
-      err[i] = p3[3] - p2[3]
+  θ = range(pm.min_angle, pm.max_angle; length=nbeams)
+  rays = tmap(θ1 -> _trace(pm, tx, θ1, p2.x), θ)
+  err = map(rays) do ray
+    p3 = ray.path[end]
+    isapprox(p3.x, p2.x; atol=pm.atol) && isapprox(p3.y, p2.y; atol=pm.atol) ? p3.z - p2.z : NaN
+  end
+  T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
+  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x))
+  erays = T2[]
+  for i ∈ 1:length(θ)
+    if isapprox(err[i], 0; atol=pm.atol)
+      push!(erays, T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x))
+    elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
+      soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
+      successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds))
+    # FIXME elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
+    #   soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-2], θ[i])), (pm, tx, p2.x, p2.z)))
+    #   successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds))
     end
   end
-  T = promote_type(envrealtype(model.env), eltype(location(tx1)), typeof(nominalfrequency(tx1)), eltype(location(rx1)))
-  erays = Array{RayArrival{T,T},1}(undef, 0)
-  for i ∈ 1:n
-    if isapprox(err[i], 0.0; atol=model.atol)
-      eray = traceray(model, tx1, convert(T, θ[i]), rmax, ds)
-      push!(erays, eray)
-    elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) == -1
-      a, b = ordered(θ[i-1], θ[i])
-      soln = Optim.optimize(ϕ -> abs2(traceray(model, tx1, ϕ, rmax).raypath[end][3] - p2[3]), a, b; abs_tol=1e-6)
-      if Optim.converged(soln) && soln.minimum ≤ 1e-2
-        eray = traceray(model, tx1, convert(T, soln.minimizer), rmax, ds)
-        push!(erays, eray)
-      end
-    elseif i > 2 && isnearzero(err[i-2], err[i-1], err[i])
-      a, b = ordered(θ[i-2], θ[i])
-      soln = Optim.optimize(ϕ -> abs2(traceray(model, tx1, ϕ, rmax).raypath[end][3] - p2[3]), a, b; abs_tol=1e-6)
-      if Optim.converged(soln) && soln.minimum ≤ 1e-2
-        eray = traceray(model, tx1, convert(T, soln.minimizer), rmax, ds)
-        push!(erays, eray)
-      end
-    end
+  sort(erays; by=Base.Fix2(getfield, :t))
+end
+
+function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; mode=:coherent)
+  arr = arrivals(pm, tx, rx)
+  length(arr) == 0 && return zero(UnderwaterAcoustics._phasortype(eltype(arr)))
+  if mode === :incoherent
+    complex(√sum(a -> abs2(a.ϕ), arr)) * db2amp(spl(tx))
+  elseif mode === :coherent
+    f = frequency(tx)
+    sum(a -> a.ϕ * cispi(2f * a.t), arr) * db2amp(spl(tx))
+  else
+    error("Unknown mode :$mode")
   end
-  erays
 end
 
-function UnderwaterAcoustics.rays(model::RaySolver, tx1::AcousticSource, θ::Real, rmax)
-  check2d([tx1], [])
-  traceray(model, tx1, θ, rmax, model.ds)
-end
-
-function UnderwaterAcoustics.transfercoef(model::RaySolver, tx1::AcousticSource, rx::AcousticReceiverGrid2D{T1}; mode=:coherent) where {T1}
-  check2d([tx1], rx)
-  mode === :coherent || mode === :incoherent || throw(ArgumentError("Unknown mode :" * string(mode)))
-  # implementation primarily based on ideas from COA (Computational Ocean Acoustics, 2nd ed., ch. 3)
-  f = nominalfrequency(tx1)
-  T = promote_type(envrealtype(model.env), eltype(location(tx1)), typeof(f), T1, ComplexF64)
-  tc = zeros(T, size(rx,1), size(rx,2), Threads.nthreads())
-  rmax = maximum(rx.xrange) + 0.1
-  nbeams = model.nbeams
-  if nbeams == 0
-    p1 = location(tx1)
+# implementation primarily based on ideas from COA (Computational Ocean Acoustics, 2nd ed., ch. 3)
+function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rxs::AcousticReceiverGrid2D; mode=:coherent)
+  _check2d([tx], rxs)
+  mode ∈ (:coherent, :incoherent) || error("Unknown mode :" * string(mode))
+  f = frequency(tx)
+  min_temp = minimum(pm.env.temperature)
+  T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
+  tc = zeros(T, size(rxs,1), size(rxs,2), Threads.nthreads())
+  rmax = maximum(rxs.xrange) + 0.1
+  h = maximum(pm.env.bathymetry)
+  if pm.nbeams > 0
+    nbeams = pm.nbeams
+  else
+    p1 = location(tx)
     R = abs(rmax - p1[1])
-    h = maxdepth(bathymetry(model.env))
-    nbeams = clamp(ceil(Int, 20 * (model.maxangle - model.minangle) / atan(h, R)), 100, 1000)
+    nbeams = clamp(ceil(Int, 20 * (pm.max_angle - pm.min_angle) / atan(h, R)), 100, 1000)
   end
-  θ = range(model.minangle, model.maxangle; length=nbeams)
+  θ = range(pm.min_angle, pm.max_angle; length=nbeams)
   δθ = Float64(θ.step)
-  c₀ = soundspeed(ssp(model.env), location(tx1)...)
+  c₀ = value(pm.env.soundspeed, location(tx))
   ω = 2π * f
   G = 1 / (2π)^(1/4)
   Threads.@threads for θ1 ∈ θ
-    β = (mode === :incoherent ? 2 : 1) * cos(θ1)/c₀
-    traceray(model, tx1, θ1, rmax, 1.0; cb = (s1, u1, s2, u2, A₀, D₀, t₀, cₛ, kmah1, kmah2) -> begin
+    β = (mode === :incoherent ? 2 : 1) * cos(θ1) / c₀
+    _trace(pm, tx, θ1, rmax, 1.0; cb = (s1, u1, s2, u2, A₀, D₀, t₀, cₛ, kmah1, kmah2) -> begin
       r1, z1, ξ1, ζ1, t1, _, q1 = u1
       r2, z2, ξ2, ζ2, t2, _, q2 = u2
-      ndx = findall(r -> r1 ≤ r < r2, rx.xrange)
+      ndx = findall(r -> r1 ≤ r < r2, rxs.xrange)
       rz1 = (r1, z1)
       vlen = norm((r2-r1, z2-z1))
       rvlen = norm((ξ1, ζ1))
       tᵥ = (ξ1, ζ1) ./ rvlen
       nᵥ = (ζ1, -ξ1) ./ rvlen
       D = D₀ + (s1 + s2) / 2
-      γ = fast_absorption(f, D, salinity(model.env))
-      Wmax = max(q1, q2) * δθ
-      ndx2 = findall(z -> min(z1, z2) - 4*Wmax ≤ z ≤ max(z1, z2) + 4*Wmax, rx.zrange)
+      γ = absorption(f, D, pm.env.salinity, min_temp, h/2)  # nominal absorption
+      Wmax4 = 4 * max(q1, q2) * δθ
+      ndx2 = findall(z -> min(z1, z2) - Wmax4 ≤ z ≤ max(z1, z2) + Wmax4, rxs.zrange)
       for j ∈ ndx
         for i ∈ ndx2
-          rz = (rx.xrange[j], rx.zrange[i])
+          rz = (rxs.xrange[j], rxs.zrange[i])
           v = rz .- rz1
           s = dot(v, tᵥ)
           n = dot(v, nᵥ)
@@ -164,30 +157,26 @@ end
 
 ### helper functions
 
-ordered(a, b) = a < b ? (a, b) : (b, a)
+_ordered(a, b) = a < b ? (a, b) : (b, a)
 
-function isnearzero(a, b, c)
-  (isnan(a) || isnan(b) || isnan(c)) && return false
-  sign(a) != sign(b) && return false
-  sign(a) != sign(c) && return false
-  abs(a) < abs(b) && return false
-  abs(c) < abs(b) && return false
-  return true
+# function _isnearzero(a, b, c)
+#   (isnan(a) || isnan(b) || isnan(c)) && return false
+#   sign(a) == sign(b) == sign(c) || return false
+#   abs(a) < abs(b) && return false
+#   abs(c) < abs(b) && return false
+#   return true
+# end
+
+function _check2d(tx, rx)
+  all(location(tx1).x == 0.0 for tx1 ∈ tx) || error("RaySolver requires transmitters at (0, 0, z)")
+  all(location(tx1).y == 0.0 for tx1 ∈ tx) || error("RaySolver requires transmitters in the x-z plane")
+  all(location(rx1).x >= 0.0 for rx1 ∈ rx) || error("RaySolver requires receivers to be in the +x halfspace")
+  all(location(rx1).y == 0.0 for rx1 ∈ rx) || error("RaySolver requires receivers in the x-z plane")
 end
 
-function check2d(tx, rx)
-  # TODO: remove restrictions on coordinates
-  all(location(tx1)[1] == 0.0 for tx1 ∈ tx) || throw(ArgumentError("RaySolver requires transmitters at (0, 0, z)"))
-  all(location(tx1)[2] == 0.0 for tx1 ∈ tx) || throw(ArgumentError("RaySolver requires transmitters in the x-z plane"))
-  all(location(rx1)[1] >= 0.0 for rx1 ∈ rx) || throw(ArgumentError("RaySolver requires receivers to be in the +x halfspace"))
-  all(location(rx1)[2] == 0.0 for rx1 ∈ rx) || throw(ArgumentError("RaySolver requires receivers in the x-z plane"))
-end
-
-function rayeqns!(du, u, params, s)
+function _∂u!(du, (r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
   # implementation based on COA (3.161-164, 3.58-63)
   # assumes range-independent soundspeed
-  r, z, ξ, ζ, t, p, q = u
-  c, ∂c, ∂²c = params
   cᵥ = c(z)
   cᵥ² = cᵥ * cᵥ
   c̄ = ∂²c(z) * ξ * ξ
@@ -200,43 +189,44 @@ function rayeqns!(du, u, params, s)
   du[7] = cᵥ * p
 end
 
-function checkray!(out, u, s, integrator, a::Altimetry, b::Bathymetry, rmax)
-  out[1] = altitude(a, u[1], 0.0) - u[2]   # surface reflection
-  out[2] = u[2] + depth(b, u[1], 0.0)      # bottom reflection
-  out[3] = rmax - u[1]                     # maximum range
-  out[4] = u[3]                            # ray turned back
+function _check_ray!(out, u, s, integrator, a, b, rmax)
+  out[1] = value(a, (u[1], 0.0, 0.0)) - u[2]    # surface reflection
+  out[2] = u[2] + value(b, (u[1], 0.0, 0.0))    # bottom reflection
+  out[3] = rmax - u[1]                          # maximum range
+  out[4] = u[3]                                 # ray turned back
 end
 
-function traceray1(T, model, r0, z0, θ, rmax, ds, p0, q0)
-  a = altimetry(model.env)
-  b = bathymetry(model.env)
-  c = z -> soundspeed(ssp(model.env), 0.0, 0.0, z)
-  ∂c = z -> ForwardDiff.derivative(c, z)
-  ∂²c = z -> ForwardDiff.derivative(∂c, z)
+function _trace1(T, pm, r0, z0, θ, rmax, ds, p0, q0)
+  a = pm.env.altimetry
+  b = pm.env.bathymetry
+  c = z -> value(pm.env.soundspeed, z)
+  ∂c = z -> derivative(c, z)
+  ∂²c = z -> derivative(∂c, z)
   cᵥ = c(z0)
   u0 = [convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
-  prob = ODEProblem{true}(rayeqns!, u0, (zero(T), one(T) * model.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
+  prob = ODEProblem{true}(_∂u!, u0, (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
   cb = VectorContinuousCallback(
-    (out, u, s, i) -> checkray!(out, u, s, i, a, b, rmax),
+    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax),
     (i, ndx) -> terminate!(i), 4; rootfind=true)
   if ds ≤ 0
-    soln = solve(prob, model.solver; abstol=model.solvertol, save_everystep=false, callback=cb)
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cb)
   else
-    soln = solve(prob, model.solver; abstol=model.solvertol, saveat=ds, callback=cb)
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cb)
   end
   s2 = soln.u[end]
   soln.t[end], s2[1], s2[2], atan(s2[4], s2[3]), s2[5], s2[6], s2[7], soln.u, soln.t
 end
 
-function traceray(model::RaySolver, tx1::AcousticSource, θ::Real, rmax, ds=0.0; cb=nothing)
+function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb=nothing)
   θ₀ = θ
-  f = nominalfrequency(tx1)
-  zmin = -maxdepth(bathymetry(model.env))
-  ϵ = one(zmin) * model.solvertol
+  f = frequency(tx1)
+  min_temp = minimum(pm.env.temperature)
+  zmin = -maximum(pm.env.bathymetry)
+  ϵ = one(zmin) * pm.solver_tol
   p = location(tx1)
-  c₀ = soundspeed(ssp(model.env), p...)
-  T = promote_type(envrealtype(model.env), eltype(p), typeof(f), typeof(θ), typeof(rmax))
-  raypath = Array{NTuple{3,T}}(undef, 0)
+  c₀ = value(pm.env.soundspeed, p)
+  T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax))
+  raypath = Array{typeof(p)}(undef, 0)
   A = one(Complex{T})   # phasor
   s = 0                 # surface bounces
   b = 0                 # bottom bounces
@@ -245,7 +235,7 @@ function traceray(model::RaySolver, tx1::AcousticSource, θ::Real, rmax, ds=0.0;
   q = zero(T)           # spreading factor
   qp = one(T) / c₀      # spreading rate
   while true
-    dD, r, z, θ, dt, qp, q, u, svec = traceray1(T, model, p[1], p[3], θ, rmax, ds, qp, q)
+    dD, r, z, θ, dt, qp, q, u, svec = _trace1(T, pm, p[1], p[3], θ, rmax, ds, qp, q)
     oq = u[1][7]
     kmah = 0
     kmahhist = zeros(length(u))
@@ -253,31 +243,35 @@ function traceray(model::RaySolver, tx1::AcousticSource, θ::Real, rmax, ds=0.0;
       sign(oq) * sign(u[i][7]) == -1 && (kmah += 1)
       kmahhist[i] = kmah
       u[i][7] != 0.0 && (oq = u[i][7])
-      push!(raypath, (u[i][1], 0.0, u[i][2]))
+      push!(raypath, xyz(u[i][1], 0.0, u[i][2]))
     end
     if cb !== nothing
       for i ∈ 2:length(u)
-        cₛ = soundspeed(ssp(model.env), (u[i-1][1]+u[i][1])/2, 0.0, (u[i-1][2]+u[i][2])/2)
+        cₛ = value(pm.env.soundspeed, ((u[i-1][1]+u[i][1])/2, 0.0, (u[i-1][2]+u[i][2])/2))
         cb(svec[i-1], u[i-1], svec[i], u[i], A, D, t, cₛ, kmahhist[i-1], kmahhist[i])
       end
     end
     t += dt
     D += dD
     A *= cis(-π/2 * kmah)                 # COA section 3.4.1 (KMAH correction)
-    zmin = -depth(bathymetry(model.env), r, 0.0)
-    zmax = altitude(altimetry(model.env), r, 0.0)
+    zmin = -value(pm.env.bathymetry, (r, 0.0, 0.0))
+    zmax = value(pm.env.altimetry, (r, 0.0, 0.0))
     p = (r, 0.0, clamp(z, zmin+ϵ, zmax-ϵ))
     if r ≥ rmax - 1e-3
       break
     elseif isapprox(z, zmax; atol=1e-3)   # hit the surface
       s += 1
-      A *= reflectioncoef(seasurface(model.env), f, π/2 - θ)
-      α = atan(ForwardDiff.derivative(x -> altitude(altimetry(model.env), x, 0.0), r))
+      ρ = value(pm.env.density, (r, 0.0, 0.0))
+      c = value(pm.env.soundspeed, (r, 0.0, 0.0))
+      A *= reflection_coef(pm.env.surface, f, π/2 - θ, ρ, c)
+      α = atan(derivative(x -> value(pm.env.altimetry, (x, 0.0, 0.0)), r))
       θ = -θ + 2α
     elseif isapprox(z, zmin; atol=1e-3)   # hit the bottom
       b += 1
-      A *= reflectioncoef(seabed(model.env), f, π/2 + θ)
-      α = atan(ForwardDiff.derivative(x -> depth(bathymetry(model.env), x, 0.0), r))
+      ρ = value(pm.env.density, (r, 0.0, z))
+      c = value(pm.env.soundspeed, (r, 0.0, z))
+      A *= reflection_coef(pm.env.seabed, f, π/2 + θ, ρ, c)
+      α = atan(derivative(x -> value(pm.env.bathymetry, (x, 0.0, 0.0)), r))
       θ = -θ - 2α
     else
       break
@@ -285,12 +279,14 @@ function traceray(model::RaySolver, tx1::AcousticSource, θ::Real, rmax, ds=0.0;
     if abs(θ) ≥ π/2
       break
     end
-    if abs(A)/abs(q) < model.athreshold
+    if abs(A)/abs(q) < pm.min_amplitude
       break
     end
   end
-  cₛ = soundspeed(ssp(model.env), p...)
-  A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))        # COA (3.65)
-  A *= fast_absorption(f, D, salinity(model.env))
-  RayArrival{T,T}(t, conj(A), s, b, θ₀, -θ, raypath)    # conj(A) needed to match with Bellhop
+  cₛ = value(pm.env.soundspeed, p)
+  A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))                   # COA (3.65)
+  A *= absorption(f, D, pm.env.salinity, min_temp, -zmin/2)   # nominal absorption
+  RayArrival(t, A, s, b, θ₀, -θ, raypath)
 end
+
+_Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax).path[end].z - z
