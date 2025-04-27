@@ -48,7 +48,7 @@ Base.show(io::IO, pm::RaySolver) = print(io, "RaySolver(⋯)")
 
 ### interface functions
 
-function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver)
+function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; paths=true)
   _check2d([tx], [rx])
   p2 = location(rx)
   nbeams = pm.nbeams
@@ -65,17 +65,17 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     isapprox(p3.x, p2.x; atol=pm.atol) && isapprox(p3.y, p2.y; atol=pm.atol) ? p3.z - p2.z : NaN
   end
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
-  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x))
+  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths))
   erays = T2[]
   for i ∈ 1:length(θ)
     if isapprox(err[i], 0; atol=pm.atol)
-      push!(erays, T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x))
+      push!(erays, T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths))
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
-      successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds))
+      successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
     # FIXME elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
     #   soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-2], θ[i])), (pm, tx, p2.x, p2.z)))
-    #   successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds))
+    #   successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
     end
   end
   sort(erays; by=Base.Fix2(getfield, :t))
@@ -217,7 +217,7 @@ function _trace1(T, pm, r0, z0, θ, rmax, ds, p0, q0)
   soln.t[end], s2[1], s2[2], atan(s2[4], s2[3]), s2[5], s2[6], s2[7], soln.u, soln.t
 end
 
-function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb=nothing)
+function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb=nothing, paths=true)
   θ₀ = θ
   f = frequency(tx1)
   min_temp = minimum(pm.env.temperature)
@@ -243,7 +243,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb
       sign(oq) * sign(u[i][7]) == -1 && (kmah += 1)
       kmahhist[i] = kmah
       u[i][7] != 0.0 && (oq = u[i][7])
-      push!(raypath, xyz(u[i][1], 0.0, u[i][2]))
+      paths && push!(raypath, xyz(u[i][1], 0.0, u[i][2]))
     end
     if cb !== nothing
       for i ∈ 2:length(u)
