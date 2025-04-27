@@ -37,7 +37,6 @@ Supported keyword arguments:
 - `max_angle`: maximum beam angle (default: 80°)
 - `ds`: nominal spacing between ray points (default: 1 m)
 - `atol`: absolute position tolerance (default: 0.0001 m)
-- `rugosity`: rugosity of the seabed (default: 1.5 m)
 - `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
 - `solver`: differential equation solver (default: nothing, auto)
 - `solver_tol`: solver tolerance (default: 1e-4)
@@ -73,7 +72,8 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
       successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
-    # FIXME elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
+    # FIXME handle the edge case where rays turn
+    # elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
     #   soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-2], θ[i])), (pm, tx, p2.x, p2.z)))
     #   successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
     end
