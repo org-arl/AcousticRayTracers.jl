@@ -1,7 +1,7 @@
 import LinearAlgebra: norm, dot
 import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, Rodas5, solve, terminate!
 import ForwardDiff: derivative
-import NonlinearSolve: IntervalNonlinearProblem
+import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import NonlinearSolve.SciMLBase: successful_retcode
 
 Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
@@ -66,16 +66,41 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
   T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths))
   erays = T2[]
-  for i ∈ 1:length(θ)
+  elock = Threads.SpinLock()
+  Threads.@threads for i ∈ 1:length(θ)
     if isapprox(err[i], 0; atol=pm.atol)
-      push!(erays, T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths))
+      # ray already at receiver
+      v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)
+      lock(() -> push!(erays, v), elock)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
+      # rays bracket the receiver, so find a root in between...
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
-      successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
-    # FIXME handle the edge case where rays turn
-    # elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
-    #   soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-2], θ[i])), (pm, tx, p2.x, p2.z)))
-    #   successful_retcode(soln.retcode) && push!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
+      if successful_retcode(soln.retcode)
+        v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
+        lock(() -> push!(erays, v), elock)
+      end
+    elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
+      # at a turning point, so potentially two roots between i-2 and i, try and find both...
+      lims = _ordered(θ[i-2], θ[i])
+      soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)))
+      if successful_retcode(soln.retcode) && lims[1] < soln.u < lims[2]
+        θ₁ = soln.u
+        v = _trace(pm, tx, θ₁, p2.x, pm.ds; paths)
+        lock(() -> push!(erays, v), elock)
+        if θ[i-1] < θ₁
+          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
+          if successful_retcode(soln.retcode) && θ₁ < soln.u < lims[2]
+            v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
+            lock(() -> push!(erays, v), elock)
+          end
+        else
+          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
+          if successful_retcode(soln.retcode) && lims[1] < soln.u < θ₁
+            v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
+            lock(() -> push!(erays, v), elock)
+          end
+        end
+      end
     end
   end
   sort(erays; by=Base.Fix2(getfield, :t))
@@ -159,13 +184,13 @@ end
 
 _ordered(a, b) = a < b ? (a, b) : (b, a)
 
-# function _isnearzero(a, b, c)
-#   (isnan(a) || isnan(b) || isnan(c)) && return false
-#   sign(a) == sign(b) == sign(c) || return false
-#   abs(a) < abs(b) && return false
-#   abs(c) < abs(b) && return false
-#   return true
-# end
+function _isnearzero(a, b, c)
+  (isnan(a) || isnan(b) || isnan(c)) && return false
+  sign(a) == sign(b) == sign(c) || return false
+  abs(a) < abs(b) && return false
+  abs(c) < abs(b) && return false
+  return true
+end
 
 function _check2d(tx, rx)
   all(location(tx1).x == 0.0 for tx1 ∈ tx) || error("RaySolver requires transmitters at (0, 0, z)")
