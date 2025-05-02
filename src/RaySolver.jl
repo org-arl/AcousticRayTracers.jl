@@ -71,14 +71,18 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     if isapprox(err[i], 0; atol=pm.atol)
       # ray already at receiver
       v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)
-      lock(() -> push!(erays, v), elock)
+      lock(elock)
+      push!(erays, v)
+      unlock(elock)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
       if successful_retcode(soln.retcode)
         v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-        lock(() -> push!(erays, v), elock)
-      end
+        lock(elock)
+        push!(erays, v)
+        unlock(elock)
+        end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
       lims = _ordered(θ[i-2], θ[i])
@@ -91,13 +95,17 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && θ₁ < soln.u < lims[2]
             v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-            lock(() -> push!(erays, v), elock)
+            lock(elock)
+            push!(erays, v)
+            unlock(elock)
           end
         else
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && lims[1] < soln.u < θ₁
             v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-            lock(() -> push!(erays, v), elock)
+            lock(elock)
+            push!(erays, v)
+            unlock(elock)
           end
         end
       end
@@ -141,12 +149,11 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   c₀ = value(pm.env.soundspeed, location(tx))
   ω = 2π * f
   G = 1 / (2π)^(1/4)
-  Threads.@threads for θ1 ∈ θ
+  Threads.@threads :static for θ1 ∈ θ
     β = (mode === :incoherent ? 2 : 1) * cos(θ1) / c₀
     _trace(pm, tx, θ1, rmax, 1.0; cb = (s1, u1, s2, u2, A₀, D₀, t₀, cₛ, kmah1, kmah2) -> begin
       r1, z1, ξ1, ζ1, t1, _, q1 = u1
       r2, z2, ξ2, ζ2, t2, _, q2 = u2
-      ndx = findall(r -> r1 ≤ r < r2, rxs.xrange)
       rz1 = (r1, z1)
       vlen = norm((r2-r1, z2-z1))
       rvlen = norm((ξ1, ζ1))
@@ -155,9 +162,10 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
       D = D₀ + (s1 + s2) / 2
       γ = absorption(f, D, pm.env.salinity, min_temp, h/2)  # nominal absorption
       Wmax4 = 4 * max(q1, q2) * δθ
-      ndx2 = findall(z -> min(z1, z2) - Wmax4 ≤ z ≤ max(z1, z2) + Wmax4, rxs.zrange)
-      for j ∈ ndx
-        for i ∈ ndx2
+      for j ∈ eachindex(rxs.xrange)
+        r1 ≤ rxs.xrange[j] < r2 || continue
+        for i ∈ eachindex(rxs.zrange)
+          min(z1, z2) - Wmax4 ≤ rxs.zrange[i] ≤ max(z1, z2) + Wmax4 || continue
           rz = (rxs.xrange[j], rxs.zrange[i])
           v = rz .- rz1
           s = dot(v, tᵥ)
