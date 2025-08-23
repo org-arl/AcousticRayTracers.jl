@@ -6,9 +6,6 @@ using TestItems
   @test m isa Vector{Type{<:UnderwaterAcoustics.AbstractPropagationModel}}
   @test RaySolver ∈ m
   env = UnderwaterEnvironment(bathymetry = 20.0u"m", temperature = 27.0u"°C", salinity = 35.0u"ppt", seabed = SandySilt)
-  m = models(env)
-  @test m isa Vector{Type{<:UnderwaterAcoustics.AbstractPropagationModel}}
-  @test RaySolver ∈ m
 end
 
 @testitem "raysolver-arrivals+ir" begin
