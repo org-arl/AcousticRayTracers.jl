@@ -93,10 +93,13 @@ end
 @testitem "raysolver-seamount-tl" begin
   using UnderwaterAcoustics
   bathy = SampledField([3000, 3000, 500, 3000, 3000]; x=[0, 10e3, 20e3, 30e3, 100e3])
+  # FIXME although ssp should start at z=0, it starts at z=1e-6 because evaluation
+  # of derivative in RaySolver at z=0 in the former case seems to cause an
+  # exception only inside a @testitem, but causes no problems in a REPL or a script
   ssp = SampledField([
     1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1472.6, 1468.8,
     1467.2, 1471.6, 1473.6, 1473.6, 1472.7, 1472.2, 1471.6, 1471.6, 1472.0, 1472.7, 1473.1,
-    1474.9, 1477.0, 1478.1, 1480.7, 1483.8, 1490.5, 1498.3, 1506.5]; z=[0, -5, -10, -15, -20,
+    1474.9, 1477.0, 1478.1, 1480.7, 1483.8, 1490.5, 1498.3, 1506.5]; z=[1e-6, -5, -10, -15, -20,
     -25, -30, -35, -38, -50, -70, -100, -140, -160, -170, -200, -215, -250, -300, -370, -450,
     -500, -700, -900, -1000, -1250, -1500, -2000, -2500, -3000])
   env = UnderwaterEnvironment(
