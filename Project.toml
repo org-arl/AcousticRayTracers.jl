@@ -1,7 +1,7 @@
 name = "AcousticRayTracers"
 uuid = "4fc4fbda-03ee-4929-b565-b3d9b12bdf79"
 authors = ["Mandar Chitre <mandar@nus.edu.sg>"]
-version = "0.3.1"
+version = "0.3.2"
 
 [deps]
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
@@ -12,8 +12,8 @@ UnderwaterAcoustics = "0efb1f7a-1ce7-46d2-9f48-546a4c8fbb99"
 
 [compat]
 ForwardDiff = "0.10,1"
-NonlinearSolve = "4.8.0"
+NonlinearSolve = "4"
 OrdinaryDiffEq = "6"
 julia = "1.10"
 LinearAlgebra = "1"
-UnderwaterAcoustics = "0.4,0.5"
+UnderwaterAcoustics = "0.4,0.5,0.6"
