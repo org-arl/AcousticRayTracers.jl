@@ -1,8 +1,9 @@
 import LinearAlgebra: norm, dot
-import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, Rodas5, solve, terminate!
+import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, AutoTsit5, solve
+import OrdinaryDiffEqRosenbrock: Rodas5
 import ForwardDiff: derivative
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
-import NonlinearSolve.SciMLBase: successful_retcode
+import SciMLBase: successful_retcode, terminate!
 
 Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   env::T1
@@ -20,7 +21,7 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
-    solver = something(solver, is_isovelocity(env) ? Tsit5() : Rodas5())
+    solver = something(solver, AutoTsit5(Rodas5()))
     new{typeof(env),typeof(solver)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
   end
 end
@@ -134,7 +135,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   f = frequency(tx)
   min_temp = minimum(pm.env.temperature)
   T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
-  tc = zeros(T, size(rxs,1), size(rxs,2), Threads.nthreads())
+  rv = zeros(T, size(rxs,1), size(rxs,2))
   rmax = maximum(rxs.xrange) + 0.1
   h = maximum(pm.env.bathymetry)
   if pm.nbeams > 0
@@ -149,7 +150,8 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   c₀ = value(pm.env.soundspeed, location(tx))
   ω = 2π * f
   G = 1 / (2π)^(1/4)
-  Threads.@threads :static for θ1 ∈ θ
+  elock = Threads.SpinLock()
+  Threads.@threads for θ1 ∈ θ
     β = (mode === :incoherent ? 2 : 1) * cos(θ1) / c₀
     _trace(pm, tx, θ1, rmax, 1.0; cb = (s1, u1, s2, u2, A₀, D₀, t₀, cₛ, kmah1, kmah2) -> begin
       r1, z1, ξ1, ζ1, t1, _, q1 = u1
@@ -178,14 +180,14 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
           A *= cis(-π/2 * kmah)                       # COA section 3.4.1 (KMAH correction)
           W = abs(q * δθ)                             # COA (3.74)
           A *= exp(-(n / W)^2)
-          tc[j, i, Threads.threadid()] += mode === :coherent ? conj(A) * cis(ω * t) : Complex(abs2(A), 0.0)
+          lock(elock)
+          rv[j, i] += mode === :coherent ? conj(A) * cis(ω * t) : Complex(abs2(A), 0.0)
+          unlock(elock)
         end
       end
     end)
   end
-  rv = dropdims(sum(tc; dims=3); dims=3)
-  mode === :incoherent && (rv = sqrt.(rv))
-  rv
+  mode === :incoherent ? sqrt.(rv) : rv
 end
 
 ### helper functions
