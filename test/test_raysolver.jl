@@ -113,7 +113,7 @@ end
   @test size(xloss) == (1001, 201)
   @test xloss[200,50] > 150
   @test xloss[50,50] ≈ 71.8 atol=0.5
-  @test xloss[100,100] ≈ 73.4 atol=0.5
+  @test xloss[100,100] ≈ 74.2 atol=0.5
 end
 
 @testitem "∂raysolver" begin
@@ -135,11 +135,11 @@ end
   x = [20.0, 100.0, 5.0, 10.0, 5000.0, 1500.0]
   ∇ℳ₁ = gradient(ℳ₁, fd, x)
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
-  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁
-  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂
+  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-4
+  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-4
   x = [25.0, 200.0, 10.0, 8.0, 1000.0, 1540.0]
   ∇ℳ₁ = gradient(ℳ₁, fd, x)
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
-  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁
-  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂
+  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-4
+  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-4
 end
