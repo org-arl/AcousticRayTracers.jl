@@ -1,7 +1,6 @@
 import LinearAlgebra: norm, dot
 import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, AutoTsit5, solve
 import OrdinaryDiffEqRosenbrock: Rodas5
-import ForwardDiff: derivative
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!
 
@@ -78,7 +77,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
-      if successful_retcode(soln.retcode)
+      if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol
         v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
         lock(elock)
         push!(erays, v)
@@ -88,13 +87,13 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
       lims = _ordered(θ[i-2], θ[i])
       soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)))
-      if successful_retcode(soln.retcode) && lims[1] < soln.u < lims[2]
+      if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
         v = _trace(pm, tx, θ₁, p2.x, pm.ds; paths)
         lock(() -> push!(erays, v), elock)
         if θ[i-1] < θ₁
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
-          if successful_retcode(soln.retcode) && θ₁ < soln.u < lims[2]
+          if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && θ₁ < soln.u < lims[2]
             v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
             lock(elock)
             push!(erays, v)
@@ -102,7 +101,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
           end
         else
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
-          if successful_retcode(soln.retcode) && lims[1] < soln.u < θ₁
+          if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < θ₁
             v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
             lock(elock)
             push!(erays, v)
@@ -325,3 +324,5 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb
 end
 
 _Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax).path[end].z - z
+
+derivative(f, x; ϵ=1e-6) = (f(x + ϵ) - f(x - ϵ)) / 2ϵ
