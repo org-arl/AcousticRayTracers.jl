@@ -1,8 +1,9 @@
 import LinearAlgebra: norm, dot
-import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, AutoTsit5, solve
+import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, solve
 import OrdinaryDiffEqRosenbrock: Rodas5
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!
+import ForwardDiff: derivative
 
 Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   env::T1
@@ -20,7 +21,7 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
-    solver = something(solver, AutoTsit5(Rodas5()))
+    solver = something(solver, is_isovelocity(env) ? Tsit5() : Rodas5())
     new{typeof(env),typeof(solver)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
   end
 end
@@ -324,5 +325,3 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb
 end
 
 _Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax).path[end].z - z
-
-derivative(f, x; ϵ=1e-6) = (f(x + ϵ) - f(x - ϵ)) / 2ϵ

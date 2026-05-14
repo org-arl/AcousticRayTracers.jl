@@ -96,6 +96,7 @@ end
   # FIXME although ssp should start at z=0, it starts at z=1e-6 because evaluation
   # of derivative in RaySolver at z=0 in the former case seems to cause an
   # exception only inside a @testitem, but causes no problems in a REPL or a script
+  # Upstream bug: https://github.com/JuliaMath/Interpolations.jl/issues/645
   ssp = SampledField([
     1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1476.7, 1472.6, 1468.8,
     1467.2, 1471.6, 1473.6, 1473.6, 1472.7, 1472.2, 1471.6, 1471.6, 1472.0, 1472.7, 1473.1,
@@ -112,8 +113,8 @@ end
   xloss = @inferred transmission_loss(pm, tx, rxs; mode=:incoherent)
   @test size(xloss) == (1001, 201)
   @test xloss[200,50] > 150
-  @test xloss[50,50] ≈ 71.8 atol=0.5
-  @test xloss[100,100] ≈ 74.2 atol=0.5
+  @test xloss[50,50] ≈ 73.6 atol=0.5
+  @test xloss[100,100] ≈ 75.9 atol=0.5
 end
 
 @testitem "∂raysolver" begin
