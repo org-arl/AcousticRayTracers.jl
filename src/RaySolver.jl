@@ -4,6 +4,7 @@ import OrdinaryDiffEqRosenbrock: Rodas5
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!
 import ForwardDiff: derivative
+import StaticArrays: SA
 
 Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   env::T1
@@ -66,53 +67,41 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   end
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
   T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths))
-  erays = T2[]
-  elock = Threads.SpinLock()
+  erays = Channel{T2}(length(θ))
   Threads.@threads for i ∈ 1:length(θ)
     if isapprox(err[i], 0; atol=pm.atol)
       # ray already at receiver
       v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)
-      lock(elock)
-      push!(erays, v)
-      unlock(elock)
+      put!(erays, v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
       if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol
-        v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-        lock(elock)
-        push!(erays, v)
-        unlock(elock)
-        end
+        put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
+      end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
       lims = _ordered(θ[i-2], θ[i])
       soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)))
       if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
-        v = _trace(pm, tx, θ₁, p2.x, pm.ds; paths)
-        lock(() -> push!(erays, v), elock)
+        put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths))
         if θ[i-1] < θ₁
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && θ₁ < soln.u < lims[2]
-            v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-            lock(elock)
-            push!(erays, v)
-            unlock(elock)
+            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
           end
         else
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < θ₁
-            v = _trace(pm, tx, soln.u, p2.x, pm.ds; paths)
-            lock(elock)
-            push!(erays, v)
-            unlock(elock)
+            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
           end
         end
       end
     end
   end
-  sort(erays; by=Base.Fix2(getfield, :t))
+  close(erays)
+  sort(collect(erays); by=Base.Fix2(getfield, :t))
 end
 
 function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; mode=:coherent)
@@ -209,19 +198,13 @@ function _check2d(tx, rx)
   all(location(rx1).y == 0.0 for rx1 ∈ rx) || error("RaySolver requires receivers in the x-z plane")
 end
 
-function _∂u!(du, (r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
+function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
   # implementation based on COA (3.161-164, 3.58-63)
   # assumes range-independent soundspeed
   cᵥ = c(z)
   cᵥ² = cᵥ * cᵥ
   c̄ = ∂²c(z) * ξ * ξ
-  du[1] = cᵥ * ξ
-  du[2] = cᵥ * ζ
-  du[3] = 0
-  du[4] = -∂c(z) / cᵥ²
-  du[5] = 1 / cᵥ
-  du[6] = -c̄ * q
-  du[7] = cᵥ * p
+  SA[cᵥ * ξ, cᵥ * ζ, 0, -∂c(z) / cᵥ², 1 / cᵥ, -c̄ * q, cᵥ * p]
 end
 
 function _check_ray!(out, u, s, integrator, a, b, rmax)
@@ -238,8 +221,8 @@ function _trace1(T, pm, r0, z0, θ, rmax, ds, p0, q0)
   ∂c = z -> derivative(c, z)
   ∂²c = z -> derivative(∂c, z)
   cᵥ = c(z0)
-  u0 = [convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
-  prob = ODEProblem{true}(_∂u!, u0, (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
+  u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
+  prob = ODEProblem{false}(_∂u, u0, (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
   cb = VectorContinuousCallback(
     (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax),
     (i, ndx) -> terminate!(i), 4; rootfind=true)
