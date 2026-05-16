@@ -155,7 +155,6 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
       cₛ = let p = pos1 + vec12 / 2                     # midpoint of ray segment
         value(pm.env.soundspeed, (p[1], 0.0, p[2]))     # nominal soundspeed
       end
-      λ = cₛ / f
       C1 = A1 * γₛ / √π                                 # √π scaling for Gaussian beams
       mode === :incoherent && (C1 *= π/2)               # scaling for incoherent summation
       C2 = δθ * cos(θ₀) * cₛ / c₀
