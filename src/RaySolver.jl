@@ -142,7 +142,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   log_γ = log(γ)
   T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
   afld = zeros(T, size(rxs,1), size(rxs,2))
-  afld_lock = Threads.ReentrantLock()
+  afld_lock = [ReentrantLock() for _ ∈ 1:size(rxs,1)]
   Threads.@threads for θ₀ ∈ θ
     ray, aux_info = _trace(pm, tx, θ₀, rmax, pm.ds; aux=true)
     for i ∈ 1:length(ray.path)-1
@@ -181,11 +181,11 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
         else
           P = complex(abs2(A * exp(-(n / W)^2)), 0.0)
         end
-        lock(afld_lock)
+        lock(afld_lock[j])
         try
           afld[j,k] += P
         finally
-          unlock(afld_lock)
+          unlock(afld_lock[j])
         end
       end
     end
@@ -228,7 +228,7 @@ function _findall_rxgrid2d(rxs, r1, r2, z1, z2, tol)
   dz = Float64(rxs.zrange.step)
   k = max(ceil(Int, (zmin - z0) / dz) + 1, 1)
   l = min(floor(Int, (zmax - z0) / dz) + 1, length(rxs.zrange))
-  i:j, k:l
+  max(min(i,j),1):min(max(i,j),length(rxs.xrange)), max(min(k,l),1):min(max(k,l),length(rxs.zrange))
 end
 
 function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
