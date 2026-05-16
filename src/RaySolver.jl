@@ -39,6 +39,7 @@ Supported keyword arguments:
 - `max_angle`: maximum beam angle (default: 80°)
 - `ds`: nominal spacing between ray points (default: 1 m)
 - `atol`: absolute position tolerance (default: 0.0001 m)
+- `rugosity`: TODO (default: 1.5)
 - `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
 - `solver`: differential equation solver (default: nothing, auto)
 - `solver_tol`: solver tolerance (default: 1e-4)
@@ -60,24 +61,24 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
-  rays = tmap(θ1 -> _trace(pm, tx, θ1, p2.x), θ)
+  rays = tmap(θ1 -> _trace(pm, tx, θ1, p2.x)[1], θ)
   err = map(rays) do ray
     p3 = ray.path[end]
     isapprox(p3.x, p2.x; atol=pm.atol) && isapprox(p3.y, p2.y; atol=pm.atol) ? p3.z - p2.z : NaN
   end
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
-  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths))
+  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths)[1])
   erays = Channel{T2}(length(θ))
   Threads.@threads for i ∈ 1:length(θ)
     if isapprox(err[i], 0; atol=pm.atol)
       # ray already at receiver
-      v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)
+      v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)[1]
       put!(erays, v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
       soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
       if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol
-        put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
+        put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
       end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
@@ -85,16 +86,16 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)))
       if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
-        put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths))
+        put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths)[1])
         if θ[i-1] < θ₁
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && θ₁ < soln.u < lims[2]
-            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
+            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
         else
           soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
           if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < θ₁
-            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths))
+            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
         end
       end
@@ -117,66 +118,80 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   end
 end
 
-# implementation primarily based on ideas from COA (Computational Ocean Acoustics, 2nd ed., ch. 3)
+# Gaussian beam implementation primarily based on ideas from:
+# [COA – Computational Ocean Acoustics, 2nd ed., ch. 3)]
 function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rxs::AcousticReceiverGrid2D; mode=:coherent)
   _check2d([tx], rxs)
   mode ∈ (:coherent, :incoherent) || error("Unknown mode :" * string(mode))
-  f = frequency(tx)
-  min_temp = minimum(pm.env.temperature)
-  T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
-  rv = zeros(T, size(rxs,1), size(rxs,2))
-  rmax = maximum(rxs.xrange) + 0.1
-  h = maximum(pm.env.bathymetry)
   if pm.nbeams > 0
     nbeams = pm.nbeams
   else
     p1 = location(tx)
-    R = abs(rmax - p1[1])
-    nbeams = clamp(ceil(Int, 20 * (pm.max_angle - pm.min_angle) / atan(h, R)), 100, 1000)
+    R = abs(maximum(rxs.xrange) - p1[1])
+    Δz = abs(Float64(rxs.zrange.step))
+    nbeams = clamp(ceil(Int, 8 * (pm.max_angle - pm.min_angle) * R / Δz), 100, 1000)
   end
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
   δθ = Float64(θ.step)
+  f = frequency(tx)
+  h = maximum(pm.env.bathymetry)
+  mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
   c₀ = value(pm.env.soundspeed, location(tx))
-  ω = 2π * f
-  G = 1 / (2π)^(1/4)
-  elock = Threads.SpinLock()
-  Threads.@threads for θ1 ∈ θ
-    β = (mode === :incoherent ? 2 : 1) * cos(θ1) / c₀
-    _trace(pm, tx, θ1, rmax, 1.0; cb = (s1, u1, s2, u2, A₀, D₀, t₀, cₛ, kmah1, kmah2) -> begin
-      r1, z1, ξ1, ζ1, t1, _, q1 = u1
-      r2, z2, ξ2, ζ2, t2, _, q2 = u2
-      rz1 = (r1, z1)
-      vlen = norm((r2-r1, z2-z1))
-      rvlen = norm((ξ1, ζ1))
-      tᵥ = (ξ1, ζ1) ./ rvlen
-      nᵥ = (ζ1, -ξ1) ./ rvlen
-      D = D₀ + (s1 + s2) / 2
-      γ = absorption(f, D, pm.env.salinity, min_temp, h/2)  # nominal absorption
-      Wmax4 = 4 * max(q1, q2) * δθ
-      for j ∈ eachindex(rxs.xrange)
-        r1 ≤ rxs.xrange[j] < r2 || continue
-        for i ∈ eachindex(rxs.zrange)
-          min(z1, z2) - Wmax4 ≤ rxs.zrange[i] ≤ max(z1, z2) + Wmax4 || continue
-          rz = (rxs.xrange[j], rxs.zrange[i])
-          v = rz .- rz1
-          s = dot(v, tᵥ)
-          n = dot(v, nᵥ)
-          α = s / vlen
-          t = t₀ + t1 + (t2 - t1) * α
-          q = q1 + (q2 - q1) * α
-          A = A₀ * γ * G * √abs(β * cₛ / (rz[1] * q)) # COA (3.76)
-          kmah = round(Int, kmah1 + (kmah2 - kmah1) * α)
-          A *= cis(-π/2 * kmah)                       # COA section 3.4.1 (KMAH correction)
-          W = abs(q * δθ)                             # COA (3.74)
-          A *= exp(-(n / W)^2)
-          lock(elock)
-          rv[j, i] += mode === :coherent ? conj(A) * cis(ω * t) : Complex(abs2(A), 0.0)
-          unlock(elock)
+  rmax = maximum(rxs.xrange) + 0.1
+  γ = absorption(f, 1, pm.env.salinity, mid_temp, h/2)  # nominal absorption per meter
+  log_γ = log(γ)
+  T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
+  afld = zeros(T, size(rxs,1), size(rxs,2))
+  afld_lock = Threads.ReentrantLock()
+  Threads.@threads for θ₀ ∈ θ
+    ray, aux_info = _trace(pm, tx, θ₀, rmax, pm.ds; aux=true)
+    for i ∈ 1:length(ray.path)-1
+      pos1 = SA[ray.path[i].x, ray.path[i].z]           # start of ray segment
+      vec12 = SA[ray.path[i+1].x, ray.path[i+1].z] - pos1   # vector to end of ray segment
+      vec12_mag2 = dot(vec12, vec12)
+      s1, q1, t1, A1 = aux_info[i]
+      s2, q2, t2, _ = aux_info[i+1]
+      γₛ = exp(log_γ * (s1 + s2) / 2)                   # nominal absorption integrated
+      cₛ = let p = pos1 + vec12 / 2                     # midpoint of ray segment
+        value(pm.env.soundspeed, (p[1], 0.0, p[2]))     # nominal soundspeed
+      end
+      λ = cₛ / f
+      C1 = A1 * γₛ / √π                                 # √π scaling for Gaussian beams
+      mode === :incoherent && (C1 *= π/2)               # scaling for incoherent summation
+      C2 = δθ * cos(θ₀) * cₛ / c₀
+      xi, zi = _findall_rxgrid2d(rxs,                   # subset of rx in neighborhood
+        ray.path[i].x, ray.path[i+1].x,                 #  of ray segment
+        ray.path[i].z, ray.path[i+1].z,
+        4 * max(abs(q1), abs(q2)) * δθ                  # size of neighborhood
+      )
+      for j ∈ xi, k ∈ zi                                # loop over the subset
+        rx = rxs[j,k].pos
+        rxpos = SA[rx.x, rx.z]
+        α = dot(rxpos - pos1, vec12) / vec12_mag2
+        0 ≤ α < 1 || continue                           # rx outside of ray segment
+        q = q1 + α * (q2 - q1)                          # spreading factor at cpa
+        W = abs(q * δθ)                                 # beam width at cpa [COA (3.74)]
+        cpa = pos1 + α * vec12                          # closest point of approach
+        n = norm(cpa - rxpos)                           # normal distance from ray to rx
+        n < 4W || continue                              # rx too far from ray segment
+        A = C1 * sqrt(C2 / (cpa[1] * W))                # [COA (3.76)]
+        if mode === :coherent
+          t = t1 + α * (t2 - t1)                        # time at cpa
+          P = A * exp(-(n / W)^2) * cispi(2f * t)       # [COA (3.72), COA (3.75)]
+        else
+          P = complex(abs2(A * exp(-(n / W)^2)), 0.0)
+        end
+        lock(afld_lock)
+        try
+          afld[j,k] += P
+        finally
+          unlock(afld_lock)
         end
       end
-    end)
+    end
   end
-  mode === :incoherent ? sqrt.(rv) : rv
+  mode === :incoherent && (afld .= sqrt.(afld))
+  afld * db2amp(spl(tx))
 end
 
 ### helper functions
@@ -198,8 +213,26 @@ function _check2d(tx, rx)
   all(location(rx1).y == 0.0 for rx1 ∈ rx) || error("RaySolver requires receivers in the x-z plane")
 end
 
+function _findall_rxgrid2d(rxs, r1, r2, z1, z2, tol)
+  rmin, rmax = _ordered(r1, r2)
+  zmin, zmax = _ordered(z1, z2)
+  rmin -= tol
+  rmax += tol
+  zmin -= tol
+  zmax += tol
+  x0 = first(rxs.xrange)
+  dx = Float64(rxs.xrange.step)
+  i = max(ceil(Int, (rmin - x0) / dx) + 1, 1)
+  j = min(floor(Int, (rmax - x0) / dx) + 1, length(rxs.xrange))
+  z0 = first(rxs.zrange)
+  dz = Float64(rxs.zrange.step)
+  k = max(ceil(Int, (zmin - z0) / dz) + 1, 1)
+  l = min(floor(Int, (zmax - z0) / dz) + 1, length(rxs.zrange))
+  i:j, k:l
+end
+
 function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
-  # implementation based on COA (3.161-164, 3.58-63)
+  # implementation based on [COA (3.161-164, 3.58-63)]
   # assumes range-independent soundspeed
   cᵥ = c(z)
   cᵥ² = cᵥ * cᵥ
@@ -214,7 +247,13 @@ function _check_ray!(out, u, s, integrator, a, b, rmax)
   out[4] = u[3]                                 # ray turned back
 end
 
-function _trace1(T, pm, r0, z0, θ, rmax, ds, p0, q0)
+# trace a ray starting at (r0, z0) with angle θ until it hits the surface,
+# bottom, or reaches rmax. T is the type to use for computations, and p0, q0
+# are the initial spreading parameters (default to 1/c₀ and 0, respectively).
+# ds controls the spacing of points along the ray (0 = only events).
+# Returns a 2-tuple of vectors containing distances along the ray, and
+# (r, z, ξ, ζ, t, p, q) values at each point.
+function _trace_segment(T, pm, r0, z0, θ, rmax, ds, p0, q0)
   a = pm.env.altimetry
   b = pm.env.bathymetry
   c = z -> value(pm.env.soundspeed, z)
@@ -225,26 +264,32 @@ function _trace1(T, pm, r0, z0, θ, rmax, ds, p0, q0)
   prob = ODEProblem{false}(_∂u, u0, (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
   cb = VectorContinuousCallback(
     (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax),
-    (i, ndx) -> terminate!(i), 4; rootfind=true)
+    (i, ndx) -> terminate!(i), 4;
+    rootfind = true
+  )
   if ds ≤ 0
     soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cb)
   else
     soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cb)
   end
-  s2 = soln.u[end]
-  soln.t[end], s2[1], s2[2], atan(s2[4], s2[3]), s2[5], s2[6], s2[7], soln.u, soln.t
+  (soln.t, soln.u)
 end
 
-function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb=nothing, paths=true)
+# trace a ray starting at tx1 with angle θ until it reaches rmax. ds controls the
+# spacing of points along the ray. If paths=true, also returns the ray path as a
+# vector of (x, y, z) points. If aux=true, also returns auxiliary info as a vector
+# of (s, q, t, A) tuples at each point.
+function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; paths=true, aux=false)
   θ₀ = θ
   f = frequency(tx1)
-  min_temp = minimum(pm.env.temperature)
+  mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
   zmin = -maximum(pm.env.bathymetry)
   ϵ = one(zmin) * pm.solver_tol
   p = location(tx1)
   c₀ = value(pm.env.soundspeed, p)
   T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax))
   raypath = Array{@NamedTuple{x::T,y::T,z::T}}(undef, 0)
+  aux_info = Array{Tuple{T,T,T,Complex{T}}}(undef, 0)
   A = one(Complex{T})   # phasor
   s = 0                 # surface bounces
   b = 0                 # bottom bounces
@@ -253,25 +298,25 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb
   q = zero(T)           # spreading factor
   qp = one(T) / c₀      # spreading rate
   while true
-    dD, r, z, θ, dt, qp, q, u, svec = _trace1(T, pm, p[1], p[3], θ, rmax, ds, qp, q)
+    svec, u = _trace_segment(T, pm, p[1], p[3], θ, rmax, ds, qp, q)
+    r, z, ξ, ζ, dt, qp, q = u[end]
+    dD = svec[end]
+    θ = atan(ζ, ξ)
     oq = u[1][7]
     kmah = 0
-    kmahhist = zeros(length(u))
-    for i ∈ 1:length(u)
+    for i ∈ eachindex(u)
       sign(oq) * sign(u[i][7]) == -1 && (kmah += 1)
-      kmahhist[i] = kmah
       u[i][7] != 0.0 && (oq = u[i][7])
       paths && push!(raypath, xyz(u[i][1], 0.0, u[i][2]))
     end
-    if cb !== nothing
-      for i ∈ 2:length(u)
-        cₛ = value(pm.env.soundspeed, ((u[i-1][1]+u[i][1])/2, 0.0, (u[i-1][2]+u[i][2])/2))
-        cb(svec[i-1], u[i-1], svec[i], u[i], A, D, t, cₛ, kmahhist[i-1], kmahhist[i])
+    if aux
+      for i ∈ eachindex(u)
+        push!(aux_info, (D + svec[i], u[i][7], t + u[i][5], A))
       end
     end
     t += dt
     D += dD
-    A *= cis(-π/2 * kmah)                 # COA section 3.4.1 (KMAH correction)
+    A *= cis(-π/2 * kmah)                 # [COA §3.4.1 (KMAH correction)]
     zmin = -value(pm.env.bathymetry, (r, 0.0, 0.0))
     zmax = value(pm.env.altimetry, (r, 0.0, 0.0))
     p = (r, 0.0, clamp(z, zmin+ϵ, zmax-ϵ))
@@ -294,17 +339,13 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; cb
     else
       break
     end
-    if abs(θ) ≥ π/2
-      break
-    end
-    if abs(A)/abs(q) < pm.min_amplitude
-      break
-    end
+    abs(θ) ≥ π/2 && break
+    abs(A)/abs(q) < pm.min_amplitude && break
   end
   cₛ = value(pm.env.soundspeed, p)
-  A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))                   # COA (3.65)
-  A *= absorption(f, D, pm.env.salinity, min_temp, -zmin/2)   # nominal absorption
-  RayArrival(t, A, s, b, θ₀, -θ, raypath)
+  A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))                   # [COA (3.65)]
+  A *= absorption(f, D, pm.env.salinity, mid_temp, -zmin/2)   # nominal absorption
+  RayArrival(t, A, s, b, θ₀, -θ, raypath), aux_info
 end
 
-_Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax).path[end].z - z
+_Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax)[1].path[end].z - z
