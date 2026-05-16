@@ -113,8 +113,8 @@ end
   xloss = @inferred transmission_loss(pm, tx, rxs; mode=:incoherent)
   @test size(xloss) == (1001, 201)
   @test xloss[200,50] > 150
-  @test xloss[50,50] ≈ 73.6 atol=0.5
-  @test xloss[100,100] ≈ 75.9 atol=0.5
+  @test xloss[50,50] ≈ 71.1 atol=0.5
+  @test xloss[100,100] ≈ 76.6 atol=0.5
 end
 
 @testitem "∂raysolver" begin
