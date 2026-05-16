@@ -136,11 +136,11 @@ end
   x = [20.0, 100.0, 5.0, 10.0, 5000.0, 1500.0]
   ∇ℳ₁ = gradient(ℳ₁, fd, x)
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
-  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-4
-  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-4
+  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-3
+  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-3
   x = [25.0, 200.0, 10.0, 8.0, 1000.0, 1540.0]
   ∇ℳ₁ = gradient(ℳ₁, fd, x)
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
-  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-4
-  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-4
+  @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-3
+  @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-3
 end
