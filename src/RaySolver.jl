@@ -19,7 +19,6 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   solver_tol::Float64 = 1e-8
   function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
     nbeams < 0 && (nbeams = 0)
-    ds ≤ 0 && (ds = minimum(env.bathymetry) / 10)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
@@ -61,6 +60,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     h = maximum(pm.env.bathymetry)
     nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
+  ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
   rays = tmap(θ1 -> _trace(pm, tx, θ1, p2.x)[1], θ)
   err = map(rays) do ray
@@ -81,7 +81,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       # rays bracket the receiver, so find a root in between...
       soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
-        put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
+        put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
       end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
@@ -89,16 +89,16 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
-        put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths)[1])
+        put!(erays, _trace(pm, tx, θ₁, p2.x, ds; paths)[1])
         if θ[i-1] < θ₁
           soln = solve(remake(prob2; u0=T1(lims[2])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && θ₁ < soln.u < lims[2]
-            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
+            put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
           end
         else
           soln = solve(remake(prob2; u0=T1(lims[1])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < θ₁
-            put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
+            put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
           end
         end
       end
@@ -134,6 +134,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
     Δz = abs(Float64(rxs.zrange.step))
     nbeams = clamp(ceil(Int, 8 * (pm.max_angle - pm.min_angle) * R / Δz), 100, 1000)
   end
+  ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
   δθ = Float64(θ.step)
   f = frequency(tx)
@@ -147,7 +148,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   afld = zeros(T, size(rxs,1), size(rxs,2))
   afld_lock = [ReentrantLock() for _ ∈ 1:size(rxs,1)]
   Threads.@threads for θ₀ ∈ θ
-    ray, aux_info = _trace(pm, tx, θ₀, rmax, pm.ds; aux=true)
+    ray, aux_info = _trace(pm, tx, θ₀, rmax, ds; aux=true)
     for i ∈ 1:length(ray.path)-1
       pos1 = SA[ray.path[i].x, ray.path[i].z]           # start of ray segment
       vec12 = SA[ray.path[i+1].x, ray.path[i+1].z] - pos1   # vector to end of ray segment
