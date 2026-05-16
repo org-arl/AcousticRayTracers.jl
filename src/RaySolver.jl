@@ -1,6 +1,6 @@
 import LinearAlgebra: norm, dot
 import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, solve
-import OrdinaryDiffEqRosenbrock: Rodas5
+import OrdinaryDiffEqRosenbrock: Rosenbrock23
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!
 import ForwardDiff: derivative
@@ -14,15 +14,15 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   ds::Float64 = 1.0
   atol::Float64 = 1e-4
   rugosity::Float64 = 1.5
-  min_amplitude::Float64 = 1e-5
+  min_amplitude::Float64 = 1e-6
   solver::T2 = nothing
-  solver_tol::Float64 = 1e-4
+  solver_tol::Float64 = 1e-8
   function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
     nbeams < 0 && (nbeams = 0)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
-    solver = something(solver, is_isovelocity(env) ? Tsit5() : Rodas5())
+    solver = something(solver, is_isovelocity(env) ? Tsit5() : Rosenbrock23())
     new{typeof(env),typeof(solver)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
   end
 end
@@ -50,7 +50,7 @@ Base.show(io::IO, pm::RaySolver) = print(io, "RaySolver(⋯)")
 
 ### interface functions
 
-function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; paths=true)
+function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; paths=true, ztol=0.1)
   _check2d([tx], [rx])
   p2 = location(rx)
   nbeams = pm.nbeams
@@ -76,25 +76,25 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       put!(erays, v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
-      soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)))
-      if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol
+      soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+      if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
         put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
       end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
       lims = _ordered(θ[i-2], θ[i])
-      soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)))
-      if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < lims[2]
+      soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+      if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
         put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths)[1])
         if θ[i-1] < θ₁
-          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)))
-          if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && θ₁ < soln.u < lims[2]
+          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+          if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && θ₁ < soln.u < lims[2]
             put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
         else
-          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)))
-          if successful_retcode(soln.retcode) && abs(soln.resid) < pm.atol && lims[1] < soln.u < θ₁
+          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+          if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < θ₁
             put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
         end
