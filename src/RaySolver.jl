@@ -2,16 +2,16 @@ import LinearAlgebra: norm, dot
 import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, solve
 import OrdinaryDiffEqRosenbrock: Rosenbrock23
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
-import SciMLBase: successful_retcode, terminate!
+import SciMLBase: successful_retcode, terminate!, remake
 import ForwardDiff: derivative
-import StaticArrays: SA
+import StaticArrays: SA, SVector
 
 Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   env::T1
   nbeams::Int = 0
   min_angle::Float64 = -deg2rad(80)
   max_angle::Float64 = +deg2rad(80)
-  ds::Float64 = 1.0
+  ds::Float64 = 0.0
   atol::Float64 = 1e-4
   rugosity::Float64 = 1.5
   min_amplitude::Float64 = 1e-6
@@ -19,6 +19,7 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   solver_tol::Float64 = 1e-8
   function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
     nbeams < 0 && (nbeams = 0)
+    ds ≤ 0 && (ds = minimum(env.bathymetry) / 10)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
@@ -37,7 +38,7 @@ Supported keyword arguments:
 - `nbeams`: number of beams to use (default: 0, auto)
 - `min_angle`: minimum beam angle (default: -80°)
 - `max_angle`: maximum beam angle (default: 80°)
-- `ds`: nominal spacing between ray points (default: 1 m)
+- `ds`: nominal spacing between ray points (default: 1/10 water depth)
 - `atol`: absolute position tolerance (default: 0.0001 m)
 - `rugosity`: TODO (default: 1.5)
 - `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
@@ -68,6 +69,8 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   end
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
   T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths)[1])
+  prob1 = IntervalNonlinearProblem{false}(_Δz, T1.((θ[1], θ[1])), (pm, tx, p2.x, p2.z))
+  prob2 = NonlinearProblem{false}(_Δz, T1(θ[1]), (pm, tx, p2.x, p2.z))
   erays = Channel{T2}(length(θ))
   Threads.@threads for i ∈ 1:length(θ)
     if isapprox(err[i], 0; atol=pm.atol)
@@ -76,24 +79,24 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       put!(erays, v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
-      soln = solve(IntervalNonlinearProblem{false}(_Δz, T1.(_ordered(θ[i-1], θ[i])), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+      soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
         put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
       end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
       lims = _ordered(θ[i-2], θ[i])
-      soln = solve(NonlinearProblem{false}(_Δz, T1(θ[i-1]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+      soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
         put!(erays, _trace(pm, tx, θ₁, p2.x, pm.ds; paths)[1])
         if θ[i-1] < θ₁
-          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[2]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+          soln = solve(remake(prob2; u0=T1(lims[2])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && θ₁ < soln.u < lims[2]
             put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
         else
-          soln = solve(NonlinearProblem{false}(_Δz, T1(lims[1]), (pm, tx, p2.x, p2.z)); abstol=pm.atol)
+          soln = solve(remake(prob2; u0=T1(lims[1])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < θ₁
             put!(erays, _trace(pm, tx, soln.u, p2.x, pm.ds; paths)[1])
           end
@@ -246,21 +249,27 @@ function _check_ray!(out, u, s, integrator, a, b, rmax)
   out[4] = u[3]                                 # ray turned back
 end
 
+# prepare to trace a ray segment
+function _prepare_trace(T, pm)
+  c = z -> value(pm.env.soundspeed, z)
+  ∂c = z -> derivative(c, z)
+  ∂²c = z -> derivative(∂c, z)
+  ODEProblem{false}(_∂u, zeros(SVector{7,T}), (zero(T), one(T)), (c, ∂c, ∂²c))
+end
+
 # trace a ray starting at (r0, z0) with angle θ until it hits the surface,
 # bottom, or reaches rmax. T is the type to use for computations, and p0, q0
 # are the initial spreading parameters (default to 1/c₀ and 0, respectively).
 # ds controls the spacing of points along the ray (0 = only events).
 # Returns a 2-tuple of vectors containing distances along the ray, and
 # (r, z, ξ, ζ, t, p, q) values at each point.
-function _trace_segment(T, pm, r0, z0, θ, rmax, ds, p0, q0)
+function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0)
   a = pm.env.altimetry
   b = pm.env.bathymetry
-  c = z -> value(pm.env.soundspeed, z)
-  ∂c = z -> derivative(c, z)
-  ∂²c = z -> derivative(∂c, z)
-  cᵥ = c(z0)
+  cᵥ = value(pm.env.soundspeed, z0)
   u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
-  prob = ODEProblem{false}(_∂u, u0, (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ)), (c, ∂c, ∂²c))
+  tspan = (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ))
+  prob = remake(prob; u0, tspan)
   cb = VectorContinuousCallback(
     (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax),
     (i, ndx) -> terminate!(i), 4;
@@ -289,6 +298,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax))
   raypath = Array{@NamedTuple{x::T,y::T,z::T}}(undef, 0)
   aux_info = Array{Tuple{T,T,T,Complex{T}}}(undef, 0)
+  prob = _prepare_trace(T, pm)
   A = one(Complex{T})   # phasor
   s = 0                 # surface bounces
   b = 0                 # bottom bounces
@@ -297,7 +307,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   q = zero(T)           # spreading factor
   qp = one(T) / c₀      # spreading rate
   while true
-    svec, u = _trace_segment(T, pm, p[1], p[3], θ, rmax, ds, qp, q)
+    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q)
     r, z, ξ, ζ, dt, qp, q = u[end]
     dD = svec[end]
     θ = atan(ζ, ξ)
