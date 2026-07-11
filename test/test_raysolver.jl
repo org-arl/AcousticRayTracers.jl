@@ -117,6 +117,106 @@ end
   @test xloss[100,100] ≈ 76.6 atol=0.5
 end
 
+@testitem "raysolver-backscatter" begin
+  using UnderwaterAcoustics
+  # null test: with nothing to backscatter, arrivals match the default solver
+  env = UnderwaterEnvironment(bathymetry=20)
+  tx = AcousticSource(0.0, -5.0, 1000.0)
+  rx = AcousticReceiver(100.0, -10.0)
+  arr0 = arrivals(RaySolver(env), tx, rx)
+  pm = @inferred RaySolver(env; backscatter=true)
+  arr1 = arrivals(pm, tx, rx)
+  @test length(arr1) ≥ 7
+  for a0 ∈ arr0[1:7]
+    @test any(a -> isapprox(a.t, a0.t; atol=1e-4) && isapprox(abs(a.ϕ), abs(a0.ϕ); rtol=0.05), arr1)
+  end
+  @test all(a -> abs(a.θᵣ) < π/2, arr1)
+  # bathymetric "wall" behind the receiver: rays travel past the receiver,
+  # reverse off the rigid slope (slope + surface bounce combinations) and
+  # return as backscattered arrivals (|arrival angle| > π/2)
+  bathy = SampledField([20, 20, 1]; x=[0, 85, 100])
+  env2 = UnderwaterEnvironment(bathymetry=bathy, seabed=RigidBoundary, soundspeed=1500.0)
+  tx2 = AcousticSource(0.0, -10.0, 1000.0)
+  rx2 = AcousticReceiver(40.0, -10.0)
+  pm2 = RaySolver(env2; backscatter=true, rmax=100.0)
+  arr2 = arrivals(pm2, tx2, rx2)
+  fwd = sort(filter(a -> abs(a.θᵣ) ≤ π/2, arr2); by=a->a.t)
+  bck = sort(filter(a -> abs(a.θᵣ) > π/2, arr2); by=a->a.t)
+  @test length(fwd) ≥ 3
+  @test length(bck) ≥ 4
+  @test fwd[1].t ≈ 40/1500 atol=1e-4                # direct arrival
+  @test bck[1].t ≈ 0.1106 atol=1e-3                 # earliest wall echo
+  @test bck[1].t > (2*85 - 40)/1500                 # slower than a straight retro-reflection
+  @test abs(bck[1].ϕ) ≈ 0.0114 rtol=0.1             # echo amplitude
+  @test abs(bck[1].ϕ) < abs(fwd[1].ϕ)               # weaker than the direct arrival
+  # all eigenray paths (forward and backscattered) must end at the receiver
+  @test all(a -> abs(a.path[end].x - 40) < 0.5 && abs(a.path[end].z + 10) < 0.5, arr2)
+end
+
+@testitem "∂raysolver-backscatter" begin
+  using UnderwaterAcoustics
+  using DifferentiationInterface
+  import ForwardDiff, FiniteDifferences
+  fd = AutoFiniteDifferences(fdm=FiniteDifferences.central_fdm(5, 1))
+  function ℳ((D, R, d1, d2, f, c))
+    env = UnderwaterEnvironment(bathymetry = D, soundspeed = c, seabed = SandySilt)
+    pm = RaySolver(env; backscatter=true)
+    transmission_loss(pm, AcousticSource((x=0.0, z=-d1), f), AcousticReceiver((x=R, z=-d2)))
+  end
+  x = [20.0, 100.0, 5.0, 10.0, 5000.0, 1500.0]
+  @test gradient(ℳ, AutoForwardDiff(), x) ≈ gradient(ℳ, fd, x) atol=1e-3
+end
+
+@testitem "raysolver-scatterers" begin
+  using UnderwaterAcoustics
+  if !isdefined(UnderwaterAcoustics, :Scatterer)
+    # awaiting the UnderwaterAcoustics.jl scatterer API (rev 3)
+    @test_skip false
+  else
+    # backscatter off a rigid circular scatterer: expect an arrival at
+    # t ≈ (48 + 38) / 1500 (tx at 0, rx at 10, scatterer surface at 48)
+    env = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
+      scatterers = (Scatterer(Ellipse(50.0, -20.0, 2.0, 2.0), RigidBoundary),))
+    tx = AcousticSource(0.0, -20.0, 5000.0)
+    rx = AcousticReceiver(10.0, -20.0)
+    pm = RaySolver(env; backscatter=true)
+    arr = arrivals(pm, tx, rx)
+    bsc = filter(a -> abs(a.θᵣ) > π/2, arr)
+    @test any(a -> isapprox(a.t, 86/1500; atol=1e-3), bsc)
+    # pressure-release scatterer: backscattered arrival flips phase by π
+    env2 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
+      scatterers = (Scatterer(Ellipse(50.0, -20.0, 2.0, 2.0), PressureReleaseBoundary),))
+    arr2 = arrivals(RaySolver(env2; backscatter=true), tx, rx)
+    bsc2 = filter(a -> abs(a.θᵣ) > π/2, arr2)
+    a1 = bsc[argmin([abs(a.t - 86/1500) for a ∈ bsc])]
+    a2 = bsc2[argmin([abs(a.t - 86/1500) for a ∈ bsc2])]
+    @test abs(angle(a1.ϕ / a2.ϕ)) ≈ π atol=0.1
+    # anti-tunneling: a small scatterer (0.5 m radius) must still be detected
+    env3 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
+      scatterers = (Scatterer(Ellipse(50.0, -20.0, 0.5, 0.5), RigidBoundary),))
+    arr3 = arrivals(RaySolver(env3; backscatter=true), tx, rx)
+    @test any(a -> abs(a.θᵣ) > π/2 && isapprox(a.t, (49.5 + 39.5)/1500; atol=1e-3), arr3)
+    # shadow: coherent field behind the scatterer drops relative to no-scatterer case
+    env4 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0)
+    rx2 = AcousticReceiver(60.0, -20.0)
+    tl_free = transmission_loss(RaySolver(env4), tx, rx2)
+    tl_shad = transmission_loss(RaySolver(env; backscatter=true), tx, rx2)
+    @test tl_shad > tl_free
+    # AD through scatterer geometry
+    using DifferentiationInterface
+    import ForwardDiff, FiniteDifferences
+    fd = AutoFiniteDifferences(fdm=FiniteDifferences.central_fdm(5, 1))
+    function ℳ((sx, sz, sa))
+      envg = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
+        scatterers = (Scatterer(Ellipse(sx, sz, sa, sa), RigidBoundary),))
+      pmg = RaySolver(envg; backscatter=true)
+      transmission_loss(pmg, AcousticSource((x=0.0, z=-20.0), 5000.0), AcousticReceiver((x=10.0, z=-20.0)))
+    end
+    x = [50.0, -20.0, 2.0]
+    @test gradient(ℳ, AutoForwardDiff(), x) ≈ gradient(ℳ, fd, x) atol=1e-3
+  end
+end
+
 @testitem "∂raysolver" begin
   using UnderwaterAcoustics
   using DifferentiationInterface
