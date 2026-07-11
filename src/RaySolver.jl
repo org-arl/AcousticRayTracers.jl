@@ -1,12 +1,20 @@
 import LinearAlgebra: norm, dot
-import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, Tsit5, solve
+import OrdinaryDiffEq: ODEProblem, VectorContinuousCallback, CallbackSet, Tsit5, solve
 import OrdinaryDiffEqRosenbrock: Rosenbrock23
+import DiffEqCallbacks: StepsizeLimiter
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!, remake
 import ForwardDiff: derivative
 import StaticArrays: SA, SVector
 
-Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
+# scatterers from the environment are wrapped into a ScattererSet at solver
+# construction; geometry queries go through the UnderwaterAcoustics scatterer API
+# (distance, boundary_projection, reflection_coef)
+struct ScattererSet{V}
+  items::V
+end
+
+Base.@kwdef struct RaySolver{T1,T2,T3} <: AbstractRayPropagationModel
   env::T1
   nbeams::Int = 0
   min_angle::Float64 = -deg2rad(80)
@@ -17,13 +25,18 @@ Base.@kwdef struct RaySolver{T1,T2} <: AbstractRayPropagationModel
   min_amplitude::Float64 = 1e-6
   solver::T2 = nothing
   solver_tol::Float64 = 1e-8
-  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
+  backscatter::Bool = false
+  rmax::Float64 = 0.0
+  scatterers::T3 = nothing
+  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmax, scatterers)
     nbeams < 0 && (nbeams = 0)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
+    rmax ≥ 0 || error("rmax should be non-negative")
     solver = something(solver, is_isovelocity(env) ? Tsit5() : Rosenbrock23())
-    new{typeof(env),typeof(solver)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol)
+    scatterers === nothing && (scatterers = _scatterer_set(env))
+    new{typeof(env),typeof(solver),typeof(scatterers)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmax, scatterers)
   end
 end
 
@@ -43,6 +56,14 @@ Supported keyword arguments:
 - `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
 - `solver`: differential equation solver (default: nothing, auto)
 - `solver_tol`: solver tolerance (default: 1e-4)
+- `backscatter`: continue tracing rays that turn back toward the source (default: false)
+- `rmax`: right edge of modeling domain in m (default: 0, auto; 2× query range with backscatter)
+
+If the environment contains scatterers (`env.scatterers`), rays reflect off them
+using the scatterer's boundary condition. With `backscatter` enabled, rays are
+traced until they exit the modeling domain `r ∈ [0, rmax]` or become too weak
+(`min_amplitude`, including absorption); backscattered arrivals are reported with
+|arrival angle| > π/2.
 """
 RaySolver(env; kwargs...) = RaySolver(; env=env, kwargs...)
 
@@ -52,6 +73,7 @@ Base.show(io::IO, pm::RaySolver) = print(io, "RaySolver(⋯)")
 
 function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; paths=true, ztol=0.1)
   _check2d([tx], [rx])
+  pm.backscatter && return _arrivals_backscatter(pm, tx, rx; paths, ztol)
   p2 = location(rx)
   nbeams = pm.nbeams
   if nbeams == 0
@@ -142,6 +164,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
   c₀ = value(pm.env.soundspeed, location(tx))
   rmax = maximum(rxs.xrange) + 0.1
+  pm.backscatter && (rmax = pm.rmax > 0 ? pm.rmax : 2 * rmax)
   γ = absorption(f, 1, pm.env.salinity, mid_temp, h/2)  # nominal absorption per meter
   log_γ = log(γ)
   T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
@@ -175,6 +198,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
         q = q1 + α * (q2 - q1)                          # spreading factor at cpa
         W = abs(q * δθ)                                 # beam width at cpa [COA (3.74)]
         cpa = pos1 + α * vec12                          # closest point of approach
+        cpa[1] > 0 || continue                          # no deposit at/behind the r=0 axis
         n = norm(cpa - rxpos)                           # normal distance from ray to rx
         n < 4W || continue                              # rx too far from ray segment
         A = C1 * sqrt(C2 / (cpa[1] * W))                # [COA (3.76)]
@@ -234,6 +258,43 @@ function _findall_rxgrid2d(rxs, r1, r2, z1, z2, tol)
   max(min(i,j),1):min(max(i,j),length(rxs.xrange)), max(min(k,l),1):min(max(k,l),length(rxs.zrange))
 end
 
+### scatterer support
+
+# wrap env.scatterers (UnderwaterAcoustics scatterer API) into a ScattererSet;
+# nothing if the environment has no scatterers
+function _scatterer_set(env)
+  s = hasproperty(env, :scatterers) ? env.scatterers : ()
+  length(s) == 0 ? nothing : ScattererSet(s)
+end
+
+# element type carried by scatterer geometry/boundary (may be a dual number)
+_scat_eltype(::Nothing) = Bool
+_scat_eltype(ss::ScattererSet) = mapreduce(_obj_eltype, promote_type, ss.items; init=Bool)
+_obj_eltype(x::Number) = typeof(real(x))
+_obj_eltype(x::Union{AbstractString,Function,Symbol}) = Bool
+_obj_eltype(x) = nfields(x) == 0 ? Bool : mapreduce(i -> _obj_eltype(getfield(x, i)), promote_type, 1:nfields(x); init=Bool)
+
+# minimum signed distance from (r, z) to any scatterer boundary (1-Lipschitz)
+_mindist(::Nothing, r, z) = nothing
+function _mindist(ss::ScattererSet, r, z)
+  pos = (x=r, y=zero(r), z=z)
+  minimum(s -> UnderwaterAcoustics.distance(s.shape, pos), ss.items)
+end
+
+# index of the scatterer nearest to (r, z)
+function _nearest(ss::ScattererSet, r, z)
+  pos = (x=r, y=zero(r), z=z)
+  jbest = 1
+  dbest = UnderwaterAcoustics.distance(ss.items[1].shape, pos)
+  for j ∈ 2:length(ss.items)
+    d = UnderwaterAcoustics.distance(ss.items[j].shape, pos)
+    d < dbest && (dbest = d; jbest = j)
+  end
+  jbest
+end
+
+### ray tracing core
+
 function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
   # implementation based on [COA (3.161-164, 3.58-63)]
   # assumes range-independent soundspeed
@@ -243,11 +304,41 @@ function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
   SA[cᵥ * ξ, cᵥ * ζ, 0, -∂c(z) / cᵥ², 1 / cᵥ, -c̄ * q, cᵥ * p]
 end
 
-function _check_ray!(out, u, s, integrator, a, b, rmax)
+# events: 1 = surface, 2 = bottom, 3 = max range, 4 = ray turned back (legacy) or
+# exited past the source (backscatter), 5 = scatterer hit, 6 = receiver range
+# crossing (recorded, not terminal). Inert slots hold one(u[1]) so they never fire
+# and preserve the element type (dual numbers).
+function _check_ray!(out, u, s, integrator, a, b, rmax, backscatter, ss, δ, guard, r_rx)
   out[1] = value(a, (u[1], 0.0, 0.0)) - u[2]    # surface reflection
   out[2] = u[2] + value(b, (u[1], 0.0, 0.0))    # bottom reflection
   out[3] = rmax - u[1]                          # maximum range
-  out[4] = u[3]                                 # ray turned back
+  out[4] = backscatter ? u[1] + δ : u[3]        # exit past source / ray turned back
+  out[5] = ss === nothing || s < guard ? one(u[1]) : _mindist(ss, u[1], u[2]) - δ
+  out[6] = isnan(r_rx) ? one(u[1]) : u[1] - r_rx
+end
+
+# handle a fired ray event: event 6 (receiver-range crossing) is recorded and
+# integration continues; any other event terminates the segment and its index is
+# reported via evref. Depending on the DiffEqBase version, ndx is either the
+# event index or a vector of simultaneous event flags (0 = not fired, ±1 = fired)
+function _ray_event!(i, ndx::Integer, crossbuf, evref)
+  if ndx == 6
+    push!(crossbuf, (i.t, i.u))
+  else
+    evref[] = Int(ndx)
+    terminate!(i)
+  end
+end
+
+function _ray_event!(i, ndx::AbstractVector, crossbuf, evref)
+  length(ndx) ≥ 6 && ndx[6] != 0 && push!(crossbuf, (i.t, i.u))
+  for k ∈ 1:min(length(ndx), 5)
+    if ndx[k] != 0
+      evref[] = k
+      terminate!(i)
+      break
+    end
+  end
 end
 
 # prepare to trace a ray segment
@@ -259,27 +350,45 @@ function _prepare_trace(T, pm)
 end
 
 # trace a ray starting at (r0, z0) with angle θ until it hits the surface,
-# bottom, or reaches rmax. T is the type to use for computations, and p0, q0
-# are the initial spreading parameters (default to 1/c₀ and 0, respectively).
-# ds controls the spacing of points along the ray (0 = only events).
+# bottom, a scatterer, or reaches the domain limits. T is the type to use for
+# computations, and p0, q0 are the initial spreading parameters (default to 1/c₀
+# and 0, respectively). ds controls the spacing of points along the ray
+# (0 = only events). guard suppresses scatterer detection for a short arc length
+# after a scatterer bounce; crossbuf collects receiver-range crossings (event 6)
+# and evref reports which terminal event fired (0 = none).
 # Returns a 2-tuple of vectors containing distances along the ray, and
 # (r, z, ξ, ζ, t, p, q) values at each point.
-function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0)
+function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax)
   a = pm.env.altimetry
   b = pm.env.bathymetry
+  ss = pm.scatterers
+  bs = pm.backscatter
   cᵥ = value(pm.env.soundspeed, z0)
   u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
-  tspan = (zero(T), one(T) * pm.rugosity * (rmax-r0)/cos(θ))
+  # legacy tspan formula assumes forward-going rays (|θ| < π/2); with backscatter
+  # or scatterers, use a geometry-based bound instead (segments end at events)
+  span = bs || ss !== nothing ? one(T) * pm.rugosity * (rmax + 4hmax) : one(T) * pm.rugosity * (rmax-r0)/cos(θ)
+  tspan = (zero(T), span)
   prob = remake(prob; u0, tspan)
+  δ = one(T) * pm.atol
   cb = VectorContinuousCallback(
-    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax),
-    (i, ndx) -> terminate!(i), 4;
+    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, bs, ss, δ, guard, r_rx),
+    (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref), 6;
     rootfind = true
   )
-  if ds ≤ 0
-    soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cb)
+  if ss === nothing
+    cbs = cb
   else
-    soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cb)
+    # anti-tunneling: since the independent variable is arc length and distance
+    # is 1-Lipschitz, dt ≤ 0.9 × distance guarantees a step cannot jump over a
+    # scatterer without the event function bracketing the surface (sphere tracing)
+    limiter = StepsizeLimiter((u, pp, s) -> max(_mindist(ss, u[1], u[2]), δ); safety_factor=9//10, cached_dtcache=zero(T))
+    cbs = CallbackSet(limiter, cb)
+  end
+  if ds ≤ 0
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cbs)
+  else
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cbs)
   end
   (soln.t, soln.u)
 end
@@ -287,28 +396,40 @@ end
 # trace a ray starting at tx1 with angle θ until it reaches rmax. ds controls the
 # spacing of points along the ray. If paths=true, also returns the ray path as a
 # vector of (x, y, z) points. If aux=true, also returns auxiliary info as a vector
-# of (s, q, t, A) tuples at each point.
-function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; paths=true, aux=false)
+# of (s, q, t, A) tuples at each point. If r_rx is given (not NaN), receiver-range
+# crossings are recorded and returned as the third element of the result.
+function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; paths=true, aux=false, r_rx=NaN)
   θ₀ = θ
   f = frequency(tx1)
   mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
-  zmin = -maximum(pm.env.bathymetry)
+  hmax = maximum(pm.env.bathymetry)
+  zmin = -hmax
   ϵ = one(zmin) * pm.solver_tol
   p = location(tx1)
   c₀ = value(pm.env.soundspeed, p)
-  T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax))
+  T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax), _scat_eltype(pm.scatterers))
   raypath = Array{@NamedTuple{x::T,y::T,z::T}}(undef, 0)
   aux_info = Array{Tuple{T,T,T,Complex{T}}}(undef, 0)
+  crossings = Array{@NamedTuple{z::T,t::T,θ::T,q::T,A::Complex{T},dir::Int,D::T,ns::Int,nb::Int,nsc::Int,pathlen::Int}}(undef, 0)
+  crossbuf = Array{Tuple{T,SVector{7,T}}}(undef, 0)
+  evref = Ref(0)
+  rxr = convert(T, r_rx)
   prob = _prepare_trace(T, pm)
   A = one(Complex{T})   # phasor
   s = 0                 # surface bounces
   b = 0                 # bottom bounces
+  sc = 0                # scatterer bounces
   t = zero(T)           # time along ray
   D = zero(T)           # distance along ray
   q = zero(T)           # spreading factor
   qp = one(T) / c₀      # spreading rate
+  guard = zero(T)       # arc length over which scatterer detection is suppressed
   while true
-    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q)
+    empty!(crossbuf)
+    evref[] = 0
+    npath0 = length(raypath)
+    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q, guard, crossbuf, evref, rxr, hmax)
+    guard = zero(T)
     r, z, ξ, ζ, dt, qp, q = u[end]
     dD = svec[end]
     θ = atan(ζ, ξ)
@@ -324,22 +445,54 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
         push!(aux_info, (D + svec[i], u[i][7], t + u[i][5], A))
       end
     end
+    for (sx, ux) ∈ crossbuf     # receiver-range crossings within this segment
+      kx = 0                    # KMAH count up to the crossing point
+      npts = 0
+      oqx = u[1][7]
+      for i ∈ eachindex(u)
+        svec[i] > sx && break
+        npts += 1
+        sign(oqx) * sign(u[i][7]) == -1 && (kx += 1)
+        u[i][7] != 0.0 && (oqx = u[i][7])
+      end
+      push!(crossings, (; z=ux[2], t=t+ux[5], θ=atan(ux[4], ux[3]), q=ux[7],
+        A=A*cis(-π/2*kx), dir=Int(sign(ux[3])), D=D+sx, ns=s, nb=b, nsc=sc,
+        pathlen=paths ? npath0+npts : 0))
+    end
     t += dt
     D += dD
     A *= cis(-π/2 * kmah)                 # [COA §3.4.1 (KMAH correction)]
     zmin = -value(pm.env.bathymetry, (r, 0.0, 0.0))
     zmax = value(pm.env.altimetry, (r, 0.0, 0.0))
     p = (r, 0.0, clamp(z, zmin+ϵ, zmax-ϵ))
+    ev = evref[]
     if r ≥ rmax - 1e-3
       break
-    elseif isapprox(z, zmax; atol=1e-3)   # hit the surface
+    elseif ev == 5                        # hit a scatterer
+      sc += 1
+      sca = pm.scatterers.items[_nearest(pm.scatterers, r, z)]
+      hit = UnderwaterAcoustics.boundary_projection(sca.shape, (x=r, y=zero(r), z=z))
+      n̂ = SA[hit.normal.x, hit.normal.z]
+      t̂ = SA[cos(θ), sin(θ)]
+      dp = dot(t̂, n̂)
+      t̂′ = t̂ - 2dp * n̂                    # specular reflection off local tangent plane
+      θ = atan(t̂′[2], t̂′[1])
+      sinθg = clamp(abs(dp), zero(dp), one(dp))
+      ρ = value(pm.env.density, (r, 0.0, z))
+      c = value(pm.env.soundspeed, (r, 0.0, z))
+      A *= reflection_coef(sca.boundary, f, asin(sinθg), ρ, c)
+      # dynamic ray tracing correction for reflection off a curved boundary
+      # [COA (3.123-3.128)]; skipped near grazing where the correction diverges
+      sinθg > 1e-3 && (qp += q * 2 * hit.curvature / (c * sinθg))
+      guard = 2 * one(T) * pm.atol
+    elseif ev == 1 && isapprox(z, zmax; atol=1e-3)   # hit the surface
       s += 1
       ρ = value(pm.env.density, (r, 0.0, 0.0))
       c = value(pm.env.soundspeed, (r, 0.0, 0.0))
       A *= reflection_coef(pm.env.surface, f, π/2 - θ, ρ, c)
       α = atan(derivative(x -> value(pm.env.altimetry, (x, 0.0, 0.0)), r))
       θ = -θ + 2α
-    elseif isapprox(z, zmin; atol=1e-3)   # hit the bottom
+    elseif ev == 2 && isapprox(z, zmin; atol=1e-3)   # hit the bottom
       b += 1
       ρ = value(pm.env.density, (r, 0.0, z))
       c = value(pm.env.soundspeed, (r, 0.0, z))
@@ -349,13 +502,134 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
     else
       break
     end
-    abs(θ) ≥ π/2 && break
-    abs(A)/abs(q) < pm.min_amplitude && break
+    if pm.backscatter
+      abs(A) * absorption(f, D, pm.env.salinity, mid_temp, hmax/2) / abs(q) < pm.min_amplitude && break
+    else
+      abs(θ) ≥ π/2 && break
+      abs(A)/abs(q) < pm.min_amplitude && break
+    end
   end
   cₛ = value(pm.env.soundspeed, p)
   A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))                   # [COA (3.65)]
   A *= absorption(f, D, pm.env.salinity, mid_temp, -zmin/2)   # nominal absorption
-  RayArrival(t, A, s, b, θ₀, -θ, raypath), aux_info
+  RayArrival(t, A, s, b, θ₀, -θ, raypath), aux_info, crossings
 end
 
 _Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax)[1].path[end].z - z
+
+### backscatter eigenray search
+
+# crossings are grouped by "signature" — direction of travel + bounce history —
+# so that the depth error Δz(θ) restricted to one signature is continuous in θ
+# and the standard bracketing/root-finding machinery applies
+_sigbase(cr) = (cr.dir, cr.ns, cr.nb, cr.nsc)
+
+# signature of each crossing: (dir, ns, nb, nsc, ordinal within that history)
+function _sigs(crossings)
+  counts = Dict{NTuple{4,Int},Int}()
+  map(crossings) do cr
+    base = _sigbase(cr)
+    k = get(counts, base, 0) + 1
+    counts[base] = k
+    (base..., k)
+  end
+end
+
+# index of the crossing matching a signature, or nothing
+function _findsig(crossings, sig)
+  base = sig[1:4]
+  k = 0
+  for i ∈ eachindex(crossings)
+    if _sigbase(crossings[i]) == base
+      k += 1
+      k == sig[5] && return i
+    end
+  end
+  nothing
+end
+
+# depth error at the receiver range for the crossing matching sig
+function _Δz_sig(ϕ, (pm, tx1, rdom, r_rx, z, sig))
+  crs = _trace(pm, tx1, ϕ, rdom; paths=false, r_rx)[3]
+  i = _findsig(crs, sig)
+  i === nothing ? convert(promote_type(typeof(ϕ), typeof(z)), NaN) : crs[i].z - z
+end
+
+# trace a ray and construct a RayArrival from the crossing matching sig,
+# applying the COA (3.65) amplitude formula and nominal absorption at the
+# crossing point; nothing if the signature is absent for this launch angle
+function _crossing_arrival(pm, tx1, θ, rdom, r_rx, sig, ds; paths=true)
+  f = frequency(tx1)
+  mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
+  hmax = maximum(pm.env.bathymetry)
+  c₀ = value(pm.env.soundspeed, location(tx1))
+  arr, _, crs = _trace(pm, tx1, θ, rdom, ds; paths, r_rx)
+  i = _findsig(crs, sig)
+  i === nothing && return nothing
+  cr = crs[i]
+  cₛ = value(pm.env.soundspeed, (r_rx, 0.0, cr.z))
+  A = cr.A * √abs(cₛ * cos(θ) / (r_rx * c₀ * cr.q))           # [COA (3.65)]
+  A *= absorption(f, cr.D, pm.env.salinity, mid_temp, hmax/2) # nominal absorption
+  path = paths ? [arr.path[1:cr.pathlen]; xyz(oftype(cr.z, r_rx), zero(cr.z), cr.z)] : arr.path[1:0]
+  RayArrival(cr.t, A, cr.ns, cr.nb, θ, -cr.θ, path)
+end
+
+function _arrivals_backscatter(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; paths=true, ztol=0.1)
+  p2 = location(rx)
+  r_rx = p2.x
+  hmax = maximum(pm.env.bathymetry)
+  rdom = pm.rmax > 0 ? pm.rmax : max(2 * r_rx, r_rx + 2 * hmax)
+  nbeams = pm.nbeams
+  if nbeams == 0
+    R = max(abs(r_rx - location(tx).x), hmax)
+    nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(hmax, R))
+  end
+  ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
+  θ = range(pm.min_angle, pm.max_angle; length=nbeams)
+  T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
+  crs_all = tmap(θ1 -> _trace(pm, tx, T1(θ1), T1(rdom); paths=false, r_rx)[3], θ)
+  allsigs = Set{NTuple{5,Int}}()
+  foreach(crs -> union!(allsigs, _sigs(crs)), crs_all)
+  T2 = typeof(RayArrival(zero(T1), zero(Complex{T1}), 0, 0, zero(T1), zero(T1),
+    Array{@NamedTuple{x::T1,y::T1,z::T1}}(undef, 0)))
+  erays = Channel{T2}(Inf)
+  for sig ∈ allsigs
+    err = map(crs_all) do crs
+      i = _findsig(crs, sig)
+      i === nothing ? T1(NaN) : T1(crs[i].z - p2.z)
+    end
+    prob1 = IntervalNonlinearProblem{false}(_Δz_sig, T1.((θ[1], θ[1])), (pm, tx, T1(rdom), T1(r_rx), T1(p2.z), sig))
+    prob2 = NonlinearProblem{false}(_Δz_sig, T1(θ[1]), (pm, tx, T1(rdom), T1(r_rx), T1(p2.z), sig))
+    Threads.@threads for i ∈ 1:length(θ)
+      if isapprox(err[i], 0; atol=pm.atol)
+        # crossing already at receiver
+        v = _crossing_arrival(pm, tx, T1(θ[i]), T1(rdom), T1(r_rx), sig, ds; paths)
+        v === nothing || put!(erays, v)
+      elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
+        # crossings bracket the receiver, so find a root in between...
+        soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
+        if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
+          v = _crossing_arrival(pm, tx, soln.u, T1(rdom), T1(r_rx), sig, ds; paths)
+          v === nothing || put!(erays, v)
+        end
+      elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
+        # at a turning point, so potentially two roots between i-2 and i, try and find both...
+        lims = _ordered(θ[i-2], θ[i])
+        soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
+        if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
+          θ₁ = soln.u
+          v = _crossing_arrival(pm, tx, θ₁, T1(rdom), T1(r_rx), sig, ds; paths)
+          v === nothing || put!(erays, v)
+          soln = solve(remake(prob2; u0=T1(θ[i-1] < θ₁ ? lims[2] : lims[1])); abstol=pm.atol)
+          if successful_retcode(soln.retcode) && abs(soln.resid) < ztol &&
+             (θ[i-1] < θ₁ ? θ₁ < soln.u < lims[2] : lims[1] < soln.u < θ₁)
+            v = _crossing_arrival(pm, tx, soln.u, T1(rdom), T1(r_rx), sig, ds; paths)
+            v === nothing || put!(erays, v)
+          end
+        end
+      end
+    end
+  end
+  close(erays)
+  sort(collect(erays); by=Base.Fix2(getfield, :t))
+end
