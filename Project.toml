@@ -1,6 +1,6 @@
 name = "AcousticRayTracers"
 uuid = "4fc4fbda-03ee-4929-b565-b3d9b12bdf79"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Mandar Chitre <mandar@nus.edu.sg>"]
 
 [deps]
