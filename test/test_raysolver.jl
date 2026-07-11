@@ -217,6 +217,65 @@ end
   end
 end
 
+@testitem "raysolver-curvature-benchmark" begin
+  using UnderwaterAcoustics
+  using UnderwaterAcoustics: absorption
+  if !isdefined(UnderwaterAcoustics, :Scatterer)
+    # awaiting the UnderwaterAcoustics.jl scatterer API (rev 3)
+    @test_skip false
+  else
+    # verify the curved-boundary beam-spreading correction against the mirror
+    # equation (geometric optics, independent of the solver's dynamic ray
+    # tracing): a convex circular reflector transforms the in-plane wavefront
+    # curvature as 1/ρ' = 1/s₁ + 2κ/sinθg
+    c = 1500.0; f = 5000.0; a = 2.0; L = 50.0
+    env = UnderwaterEnvironment(bathymetry=200.0, soundspeed=c,
+      seabed=FluidBoundary(water_density(), c, 0.0),  # non-reflecting
+      scatterers=(Scatterer(Ellipse(L, -100.0, a, a), RigidBoundary),))
+    mid_temp = (minimum(env.temperature) + maximum(env.temperature)) / 2
+    hmax = 200.0
+    tx = AcousticSource(0.0, -100.0, f)
+    pm = RaySolver(env; backscatter=true, rmax=100.0, nbeams=2000)
+    function analytic_echo(txp, rxp)
+      # specular point on the tx-facing half of the circle by Fermat
+      path(u) = begin
+        p = boundary_point(Ellipse(L, -100.0, a, a), u)
+        hypot(p.x - txp[1], p.z - txp[2]) + hypot(p.x - rxp[1], p.z - rxp[2])
+      end
+      lo, hi = 0.25, 0.75
+      φ = (√5 - 1) / 2
+      for _ in 1:200
+        m1 = hi - φ * (hi - lo); m2 = lo + φ * (hi - lo)
+        path(m1) < path(m2) ? (hi = m2) : (lo = m1)
+      end
+      u = (lo + hi) / 2
+      P = boundary_point(Ellipse(L, -100.0, a, a), u)
+      n̂ = (x=(P.x - L)/a, z=(P.z + 100.0)/a)
+      s₁ = hypot(P.x - txp[1], P.z - txp[2])
+      s₂ = hypot(P.x - rxp[1], P.z - rxp[2])
+      t̂ = ((P.x - txp[1])/s₁, (P.z - txp[2])/s₁)
+      sinθg = abs(t̂[1]*n̂.x + t̂[2]*n̂.z)
+      ρ′ = 1 / (1/s₁ + 2/(a*sinθg))          # mirror equation, convex
+      q_rx = s₁ * (ρ′ + s₂) / ρ′             # in-plane spreading at receiver
+      θ₀ = atan(P.z - txp[2], P.x - txp[1])
+      D = s₁ + s₂
+      A = √abs(cos(θ₀) * c / (rxp[1] * c * q_rx)) * absorption(f, D, env.salinity, mid_temp, hmax/2)
+      (A=A, t=D/c)
+    end
+    # normal incidence through strongly oblique (sinθg ≈ 0.93)
+    for rxp ∈ ((10.0, -100.0), (15.0, -92.0), (10.0, -70.0), (5.0, -60.0))
+      arr = arrivals(pm, tx, AcousticReceiver(rxp[1], rxp[2]))
+      ref = analytic_echo((0.0, -100.0), rxp)
+      bck = filter(x -> abs(x.θᵣ) > π/2 && isapprox(x.t, ref.t; atol=2e-4), arr)
+      @test !isempty(bck)
+      if !isempty(bck)
+        m = bck[argmin([abs(x.t - ref.t) for x ∈ bck])]
+        @test abs(m.ϕ) ≈ ref.A rtol=1e-3
+      end
+    end
+  end
+end
+
 @testitem "∂raysolver" begin
   using UnderwaterAcoustics
   using DifferentiationInterface
