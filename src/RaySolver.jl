@@ -26,17 +26,19 @@ Base.@kwdef struct RaySolver{T1,T2,T3} <: AbstractRayPropagationModel
   solver::T2 = nothing
   solver_tol::Float64 = 1e-8
   backscatter::Bool = false
+  rmin::Float64 = 0.0
   rmax::Float64 = 0.0
   scatterers::T3 = nothing
-  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmax, scatterers)
+  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers)
     nbeams < 0 && (nbeams = 0)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
     min_angle < max_angle || error("max_angle should be more than min_angle")
+    rmin ≤ 0 || error("rmin should be non-positive")
     rmax ≥ 0 || error("rmax should be non-negative")
     solver = something(solver, is_isovelocity(env) ? Tsit5() : Rosenbrock23())
     scatterers === nothing && (scatterers = _scatterer_set(env))
-    new{typeof(env),typeof(solver),typeof(scatterers)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmax, scatterers)
+    new{typeof(env),typeof(solver),typeof(scatterers)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers)
   end
 end
 
@@ -57,13 +59,18 @@ Supported keyword arguments:
 - `solver`: differential equation solver (default: nothing, auto)
 - `solver_tol`: solver tolerance (default: 1e-4)
 - `backscatter`: continue tracing rays that turn back toward the source (default: false)
-- `rmax`: right edge of modeling domain in m (default: 0, auto; 2× query range with backscatter)
+- `rmin`: left edge of modeling domain in m, ≤ 0 (default: 0; only meaningful with backscatter)
+- `rmax`: right edge of modeling domain in m (default: 0, auto = query range)
 
 If the environment contains scatterers (`env.scatterers`), rays reflect off them
 using the scatterer's boundary condition. With `backscatter` enabled, rays are
-traced until they exit the modeling domain `r ∈ [0, rmax]` or become too weak
+traced until they exit the modeling domain `r ∈ [rmin, rmax]` or become too weak
 (`min_amplitude`, including absorption); backscattered arrivals are reported with
-|arrival angle| > π/2.
+|arrival angle| > π/2. Features outside the modeling domain are invisible; set
+`rmax` beyond the query range to capture echoes from behind the receivers.
+If `rmin < 0`, a second fan of rays with the same elevation angles is launched
+in the -x direction, so that features to the left of the transmitter can also
+produce echoes (such arrivals have |launch angle| > π/2).
 """
 RaySolver(env; kwargs...) = RaySolver(; env=env, kwargs...)
 
@@ -164,13 +171,14 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   mid_temp = (minimum(pm.env.temperature) + maximum(pm.env.temperature)) / 2
   c₀ = value(pm.env.soundspeed, location(tx))
   rmax = maximum(rxs.xrange) + 0.1
-  pm.backscatter && (rmax = pm.rmax > 0 ? pm.rmax : 2 * rmax)
+  pm.backscatter && pm.rmax > 0 && (rmax = pm.rmax)
   γ = absorption(f, 1, pm.env.salinity, mid_temp, h/2)  # nominal absorption per meter
   log_γ = log(γ)
   T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
   afld = zeros(T, size(rxs,1), size(rxs,2))
   afld_lock = [ReentrantLock() for _ ∈ 1:size(rxs,1)]
-  Threads.@threads for θ₀ ∈ θ
+  θs = pm.backscatter && pm.rmin < 0 ? vcat(collect(θ), rem2pi.(π .- θ, RoundNearest)) : collect(θ)
+  Threads.@threads for θ₀ ∈ θs
     ray, aux_info = _trace(pm, tx, θ₀, rmax, ds; aux=true)
     for i ∈ 1:length(ray.path)-1
       pos1 = SA[ray.path[i].x, ray.path[i].z]           # start of ray segment
@@ -184,7 +192,7 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
       end
       C1 = A1 * γₛ / √π                                 # √π scaling for Gaussian beams
       mode === :incoherent && (C1 *= π/2)               # scaling for incoherent summation
-      C2 = δθ * cos(θ₀) * cₛ / c₀
+      C2 = δθ * abs(cos(θ₀)) * cₛ / c₀
       xi, zi = _findall_rxgrid2d(rxs,                   # subset of rx in neighborhood
         ray.path[i].x, ray.path[i+1].x,                 #  of ray segment
         ray.path[i].z, ray.path[i+1].z,
@@ -308,11 +316,11 @@ end
 # exited past the source (backscatter), 5 = scatterer hit, 6 = receiver range
 # crossing (recorded, not terminal). Inert slots hold one(u[1]) so they never fire
 # and preserve the element type (dual numbers).
-function _check_ray!(out, u, s, integrator, a, b, rmax, backscatter, ss, δ, guard, r_rx)
+function _check_ray!(out, u, s, integrator, a, b, rmax, rmin, backscatter, ss, δ, guard, r_rx)
   out[1] = value(a, (u[1], 0.0, 0.0)) - u[2]    # surface reflection
   out[2] = u[2] + value(b, (u[1], 0.0, 0.0))    # bottom reflection
   out[3] = rmax - u[1]                          # maximum range
-  out[4] = backscatter ? u[1] + δ : u[3]        # exit past source / ray turned back
+  out[4] = backscatter ? u[1] - rmin + δ : u[3] # exit domain left / ray turned back
   out[5] = ss === nothing || s < guard ? one(u[1]) : _mindist(ss, u[1], u[2]) - δ
   out[6] = isnan(r_rx) ? one(u[1]) : u[1] - r_rx
 end
@@ -367,12 +375,13 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
   u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
   # legacy tspan formula assumes forward-going rays (|θ| < π/2); with backscatter
   # or scatterers, use a geometry-based bound instead (segments end at events)
-  span = bs || ss !== nothing ? one(T) * pm.rugosity * (rmax + 4hmax) : one(T) * pm.rugosity * (rmax-r0)/cos(θ)
+  rmin = one(T) * pm.rmin
+  span = bs || ss !== nothing ? one(T) * pm.rugosity * (rmax - rmin + 4hmax) : one(T) * pm.rugosity * (rmax-r0)/cos(θ)
   tspan = (zero(T), span)
   prob = remake(prob; u0, tspan)
   δ = one(T) * pm.atol
   cb = VectorContinuousCallback(
-    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, bs, ss, δ, guard, r_rx),
+    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, rmin, bs, ss, δ, guard, r_rx),
     (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref), 6;
     rootfind = true
   )
@@ -578,7 +587,7 @@ function _arrivals_backscatter(pm::RaySolver, tx::AbstractAcousticSource, rx::Ab
   p2 = location(rx)
   r_rx = p2.x
   hmax = maximum(pm.env.bathymetry)
-  rdom = pm.rmax > 0 ? pm.rmax : max(2 * r_rx, r_rx + 2 * hmax)
+  rdom = pm.rmax > 0 ? pm.rmax : r_rx + 0.1
   nbeams = pm.nbeams
   if nbeams == 0
     R = max(abs(r_rx - location(tx).x), hmax)
@@ -587,29 +596,42 @@ function _arrivals_backscatter(pm::RaySolver, tx::AbstractAcousticSource, rx::Ab
   ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
-  crs_all = tmap(θ1 -> _trace(pm, tx, T1(θ1), T1(rdom); paths=false, r_rx)[3], θ)
-  allsigs = Set{NTuple{5,Int}}()
-  foreach(crs -> union!(allsigs, _sigs(crs)), crs_all)
   T2 = typeof(RayArrival(zero(T1), zero(Complex{T1}), 0, 0, zero(T1), zero(T1),
     Array{@NamedTuple{x::T1,y::T1,z::T1}}(undef, 0)))
   erays = Channel{T2}(Inf)
+  _fan_search!(erays, pm, tx, collect(T1, θ), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths)
+  if pm.rmin < 0    # also insonify the left halfspace with a mirrored fan
+    _fan_search!(erays, pm, tx, collect(T1, rem2pi.(π .- θ, RoundNearest)), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths)
+  end
+  close(erays)
+  sort(collect(erays); by=Base.Fix2(getfield, :t))
+end
+
+# eigenray search over one launch-angle fan: find receiver-range crossings for
+# each launch angle, group by signature, and root-find on the per-signature
+# depth error using the same 3-way logic as the forward eigenray search
+function _fan_search!(erays, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths)
+  T1 = eltype(θ)
+  crs_all = tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ)
+  allsigs = Set{NTuple{5,Int}}()
+  foreach(crs -> union!(allsigs, _sigs(crs)), crs_all)
   for sig ∈ allsigs
     err = map(crs_all) do crs
       i = _findsig(crs, sig)
-      i === nothing ? T1(NaN) : T1(crs[i].z - p2.z)
+      i === nothing ? T1(NaN) : T1(crs[i].z - zrx)
     end
-    prob1 = IntervalNonlinearProblem{false}(_Δz_sig, T1.((θ[1], θ[1])), (pm, tx, T1(rdom), T1(r_rx), T1(p2.z), sig))
-    prob2 = NonlinearProblem{false}(_Δz_sig, T1(θ[1]), (pm, tx, T1(rdom), T1(r_rx), T1(p2.z), sig))
+    prob1 = IntervalNonlinearProblem{false}(_Δz_sig, T1.((θ[1], θ[1])), (pm, tx, rdom, r_rx, zrx, sig))
+    prob2 = NonlinearProblem{false}(_Δz_sig, T1(θ[1]), (pm, tx, rdom, r_rx, zrx, sig))
     Threads.@threads for i ∈ 1:length(θ)
       if isapprox(err[i], 0; atol=pm.atol)
         # crossing already at receiver
-        v = _crossing_arrival(pm, tx, T1(θ[i]), T1(rdom), T1(r_rx), sig, ds; paths)
+        v = _crossing_arrival(pm, tx, θ[i], rdom, r_rx, sig, ds; paths)
         v === nothing || put!(erays, v)
       elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
         # crossings bracket the receiver, so find a root in between...
         soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
         if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
-          v = _crossing_arrival(pm, tx, soln.u, T1(rdom), T1(r_rx), sig, ds; paths)
+          v = _crossing_arrival(pm, tx, soln.u, rdom, r_rx, sig, ds; paths)
           v === nothing || put!(erays, v)
         end
       elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
@@ -618,18 +640,17 @@ function _arrivals_backscatter(pm::RaySolver, tx::AbstractAcousticSource, rx::Ab
         soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
         if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
           θ₁ = soln.u
-          v = _crossing_arrival(pm, tx, θ₁, T1(rdom), T1(r_rx), sig, ds; paths)
+          v = _crossing_arrival(pm, tx, θ₁, rdom, r_rx, sig, ds; paths)
           v === nothing || put!(erays, v)
           soln = solve(remake(prob2; u0=T1(θ[i-1] < θ₁ ? lims[2] : lims[1])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol &&
              (θ[i-1] < θ₁ ? θ₁ < soln.u < lims[2] : lims[1] < soln.u < θ₁)
-            v = _crossing_arrival(pm, tx, soln.u, T1(rdom), T1(r_rx), sig, ds; paths)
+            v = _crossing_arrival(pm, tx, soln.u, rdom, r_rx, sig, ds; paths)
             v === nothing || put!(erays, v)
           end
         end
       end
     end
   end
-  close(erays)
-  sort(collect(erays); by=Base.Fix2(getfield, :t))
+  nothing
 end
