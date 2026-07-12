@@ -104,7 +104,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths)[1])
   prob1 = IntervalNonlinearProblem{false}(_Δz, T1.((θ[1], θ[1])), (pm, tx, p2.x, p2.z))
   prob2 = NonlinearProblem{false}(_Δz, T1(θ[1]), (pm, tx, p2.x, p2.z))
-  erays = [T2[] for _ ∈ 1:length(θ)]
+  erays = Vector{T2}[T2[] for _ ∈ 1:length(θ)]
   _tforeach(length(θ), ntasks) do i
     if isapprox(err[i], 0; atol=pm.atol)
       # ray already at receiver
@@ -647,7 +647,7 @@ end
 # eigenray search over one launch-angle fan: find receiver-range crossings for
 # each launch angle, group by signature, and root-find on the per-signature
 # depth error using the same 3-way logic as the forward eigenray search
-function _fan_search(T2::Type, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths)
+function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths) where T2
   T1 = eltype(θ)
   ntasks = _ntasks(pm)
   crs_all = _tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ, ntasks)
@@ -661,7 +661,7 @@ function _fan_search(T2::Type, pm::RaySolver, tx::AbstractAcousticSource, θ, rd
     end
     prob1 = IntervalNonlinearProblem{false}(_Δz_sig, T1.((θ[1], θ[1])), (pm, tx, rdom, r_rx, zrx, sig))
     prob2 = NonlinearProblem{false}(_Δz_sig, T1(θ[1]), (pm, tx, rdom, r_rx, zrx, sig))
-    results = [T2[] for _ ∈ 1:length(θ)]
+    results = Vector{T2}[T2[] for _ ∈ 1:length(θ)]
     _tforeach(length(θ), ntasks) do i
       if isapprox(err[i], 0; atol=pm.atol)
         # crossing already at receiver
