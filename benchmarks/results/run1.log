@@ -1,0 +1,42 @@
+┌ Info: === scenario: pekeris
+└   scn.description = "Isovelocity Pekeris waveguide: 20 m flat, sandy seabed, 1 kHz"
+┌ Error: scenario pekeris failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: lloyd
+└   scn.description = "Lloyd mirror: 5 km deep isovelocity, near-surface source, 150 Hz"
+┌ Error: scenario lloyd failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: munk50
+└   scn.description = "Munk profile deep water, 50 Hz, 100 km"
+┌ Error: scenario munk50 failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: munk230
+└   scn.description = "Munk profile deep water, 230 Hz, 100 km"
+┌ Error: scenario munk230 failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: wedge
+└   scn.description = "Upslope wedge: 200 m → 20 m over 4 km, isovelocity, 100 Hz"
+┌ Error: scenario wedge failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: seamount
+└   scn.description = "Seamount + Munk-like SSP, 230 Hz, 100 km (from test suite)"
+┌ Error: scenario seamount failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: downref
+└   scn.description = "Downward-refracting shallow gradient: 1500→1480 m/s over 40 m, silt, 500 Hz"
+┌ Error: scenario downref failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: === scenario: duct
+└   scn.description = "Surface duct: upward-refracting near-surface gradient, 1 kHz"
+┌ Error: scenario duct failed
+│   err = FieldError: type AcousticReceiver has no field `z`, available fields: `pos`
+└ @ Main ~/Projects/AcousticRayTracers-benchmark/benchmarks/run_benchmarks.jl:73
+┌ Info: done
+└   version_key() = "b3a78c5-reg"
