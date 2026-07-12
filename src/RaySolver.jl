@@ -206,7 +206,8 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
       xi, zi = _findall_rxgrid2d(rxs,                   # subset of rx in neighborhood
         ray.path[i].x, ray.path[i+1].x,                 #  of ray segment
         ray.path[i].z, ray.path[i+1].z,
-        4 * max(abs(q1), abs(q2)) * δθ                  # size of neighborhood
+        # neighborhood must cover the clamped minimum beam width (≤ πλ) too
+        max(4 * max(abs(q1), abs(q2)) * δθ, 4π * cₛ / f)
       )
       for j ∈ xi, k ∈ zi                                # loop over the subset
         rx = rxs[j,k].pos
@@ -214,14 +215,20 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
         α = dot(rxpos - pos1, vec12) / vec12_mag2
         0 ≤ α < 1 || continue                           # rx outside of ray segment
         q = q1 + α * (q2 - q1)                          # spreading factor at cpa
+        t = t1 + α * (t2 - t1)                          # time at cpa
         W = abs(q * δθ)                                 # beam width at cpa [COA (3.74)]
+        # in incoherent mode, clamp beam width from below near caustics (q → 0
+        # makes the beam infinitesimally narrow and its amplitude blow up);
+        # same rule (and units quirk) as BELLHOP's InfluenceGeoGaussianCart:
+        # min(0.2 f t, π λ). Not applied in coherent mode, where beams wider
+        # than the multipath image separation would blur interference fringes.
+        mode === :incoherent && (W = max(W, min(0.2 * f * t, π * cₛ / f)))
         cpa = pos1 + α * vec12                          # closest point of approach
         cpa[1] > 0 || continue                          # no deposit at/behind the r=0 axis
         n = norm(cpa - rxpos)                           # normal distance from ray to rx
         n < 4W || continue                              # rx too far from ray segment
         A = C1 * sqrt(C2 / (cpa[1] * W))                # [COA (3.76)]
         if mode === :coherent
-          t = t1 + α * (t2 - t1)                        # time at cpa
           P = A * exp(-(n / W)^2) * cispi(2f * t)       # [COA (3.72), COA (3.75)]
         else
           P = complex(abs2(A * exp(-(n / W)^2)), 0.0)

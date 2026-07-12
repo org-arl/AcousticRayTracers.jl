@@ -113,12 +113,12 @@ end
   xloss = @inferred transmission_loss(pm, tx, rxs; mode=:incoherent)
   @test size(xloss) == (1001, 201)
   @test xloss[200,50] > 150
-  # reference values at the auto-nbeams default (cap raised 1000 → 4000; the
-  # old constants 71.1 / 76.6 were unconverged-in-beams artifacts); BELLHOP
-  # gives 75.69 at [100,100] — the remaining bias is the SSP-knot p-jump
-  # (issue #24) and closes to 75.77 with its fix
-  @test xloss[50,50] ≈ 69.98 atol=0.5
-  @test xloss[100,100] ≈ 73.48 atol=0.5
+  # reference values at the auto-nbeams default (cap raised 1000 → 4000) with
+  # the incoherent beam-width clamp (the old constants 71.1 / 76.6 were
+  # unconverged-in-beams artifacts); BELLHOP gives 75.69 at [100,100] — the
+  # remaining bias is the SSP-knot p-jump (issue #24, fixed in PR #26)
+  @test xloss[50,50] ≈ 70.64 atol=0.5
+  @test xloss[100,100] ≈ 74.32 atol=0.5
 end
 
 @testitem "raysolver-backscatter" begin
