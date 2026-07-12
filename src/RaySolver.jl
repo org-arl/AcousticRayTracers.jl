@@ -29,7 +29,8 @@ Base.@kwdef struct RaySolver{T1,T2,T3} <: AbstractRayPropagationModel
   rmin::Float64 = 0.0
   rmax::Float64 = 0.0
   scatterers::T3 = nothing
-  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers)
+  ntasks::Int = 0
+  function RaySolver(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers, ntasks)
     nbeams < 0 && (nbeams = 0)
     -π/2 ≤ min_angle ≤ π/2 || error("min_angle should be between -π/2 and π/2")
     -π/2 ≤ max_angle ≤ π/2 || error("max_angle should be between -π/2 and π/2")
@@ -38,7 +39,7 @@ Base.@kwdef struct RaySolver{T1,T2,T3} <: AbstractRayPropagationModel
     rmax ≥ 0 || error("rmax should be non-negative")
     solver = something(solver, is_isovelocity(env) ? Tsit5() : Rosenbrock23())
     scatterers === nothing && (scatterers = _scatterer_set(env))
-    new{typeof(env),typeof(solver),typeof(scatterers)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers)
+    new{typeof(env),typeof(solver),typeof(scatterers)}(env, nbeams, min_angle, max_angle, ds, atol, rugosity, min_amplitude, solver, solver_tol, backscatter, rmin, rmax, scatterers, ntasks)
   end
 end
 
@@ -61,6 +62,8 @@ Supported keyword arguments:
 - `backscatter`: continue tracing rays that turn back toward the source (default: false)
 - `rmin`: left edge of modeling domain in m, ≤ 0 (default: 0; only meaningful with backscatter)
 - `rmax`: right edge of modeling domain in m (default: 0, auto = query range)
+- `ntasks`: number of parallel tasks to use (default: 0, auto = number of threads;
+  1 = serial, useful for benchmarking and for AD tools that dislike threads)
 
 If the environment contains scatterers (`env.scatterers`), rays reflect off them
 using the scatterer's boundary condition. With `backscatter` enabled, rays are
@@ -90,8 +93,9 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
     nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
   ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
+  ntasks = _ntasks(pm)
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
-  rays = tmap(θ1 -> _trace(pm, tx, θ1, p2.x)[1], θ)
+  rays = _tmap(θ1 -> _trace(pm, tx, θ1, p2.x)[1], θ, ntasks)
   err = map(rays) do ray
     p3 = ray.path[end]
     isapprox(p3.x, p2.x; atol=pm.atol) && isapprox(p3.y, p2.y; atol=pm.atol) ? p3.z - p2.z : NaN
@@ -100,17 +104,17 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths)[1])
   prob1 = IntervalNonlinearProblem{false}(_Δz, T1.((θ[1], θ[1])), (pm, tx, p2.x, p2.z))
   prob2 = NonlinearProblem{false}(_Δz, T1(θ[1]), (pm, tx, p2.x, p2.z))
-  erays = Channel{T2}(length(θ))
-  Threads.@threads for i ∈ 1:length(θ)
+  erays = [T2[] for _ ∈ 1:length(θ)]
+  _tforeach(length(θ), ntasks) do i
     if isapprox(err[i], 0; atol=pm.atol)
       # ray already at receiver
       v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)[1]
-      put!(erays, v)
+      push!(erays[i], v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
       soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
-        put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
+        push!(erays[i], _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
       end
     elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
       # at a turning point, so potentially two roots between i-2 and i, try and find both...
@@ -118,23 +122,16 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
         θ₁ = soln.u
-        put!(erays, _trace(pm, tx, θ₁, p2.x, ds; paths)[1])
-        if θ[i-1] < θ₁
-          soln = solve(remake(prob2; u0=T1(lims[2])); abstol=pm.atol)
-          if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && θ₁ < soln.u < lims[2]
-            put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
-          end
-        else
-          soln = solve(remake(prob2; u0=T1(lims[1])); abstol=pm.atol)
-          if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < θ₁
-            put!(erays, _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
-          end
+        push!(erays[i], _trace(pm, tx, θ₁, p2.x, ds; paths)[1])
+        soln = solve(remake(prob2; u0=T1(θ[i-1] < θ₁ ? lims[2] : lims[1])); abstol=pm.atol)
+        if successful_retcode(soln.retcode) && abs(soln.resid) < ztol &&
+           (θ[i-1] < θ₁ ? θ₁ < soln.u < lims[2] : lims[1] < soln.u < θ₁)
+          push!(erays[i], _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
         end
       end
     end
   end
-  close(erays)
-  sort(collect(erays); by=Base.Fix2(getfield, :t))
+  sort!(reduce(vcat, erays); by=Base.Fix2(getfield, :t))
 end
 
 function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; mode=:coherent)
@@ -175,10 +172,11 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
   γ = absorption(f, 1, pm.env.salinity, mid_temp, h/2)  # nominal absorption per meter
   log_γ = log(γ)
   T = promote_type(env_type(pm.env), eltype(location(tx)), typeof(f), ComplexF64)
-  afld = zeros(T, size(rxs,1), size(rxs,2))
-  afld_lock = [ReentrantLock() for _ ∈ 1:size(rxs,1)]
   θs = pm.backscatter && pm.rmin < 0 ? vcat(collect(θ), rem2pi.(π .- θ, RoundNearest)) : collect(θ)
-  Threads.@threads for θ₀ ∈ θs
+  # deposit the Gaussian beam contributions of one ray onto a field array;
+  # each task accumulates into its own private array (no locks), and the
+  # per-task arrays are summed at the end
+  function beam!(afld, θ₀)
     ray, aux_info = _trace(pm, tx, θ₀, rmax, ds; aux=true)
     for i ∈ 1:length(ray.path)-1
       pos1 = SA[ray.path[i].x, ray.path[i].z]           # start of ray segment
@@ -216,13 +214,29 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
         else
           P = complex(abs2(A * exp(-(n / W)^2)), 0.0)
         end
-        lock(afld_lock[j])
-        try
-          afld[j,k] += P
-        finally
-          unlock(afld_lock[j])
-        end
+        afld[j,k] += P
       end
+    end
+    afld
+  end
+  nt = min(_ntasks(pm), length(θs))
+  afld = zeros(T, size(rxs,1), size(rxs,2))
+  if nt ≤ 1
+    foreach(θ₀ -> beam!(afld, θ₀), θs)
+  else
+    # beams are interleaved across tasks for load balancing (work per beam is
+    # uneven); each task returns its private field array
+    tasks = map(1:nt) do c
+      Threads.@spawn begin
+        buf = zeros(T, size(rxs,1), size(rxs,2))
+        for θ₀ ∈ @view θs[c:nt:end]
+          beam!(buf, θ₀)
+        end
+        buf
+      end
+    end
+    for t ∈ tasks
+      afld .+= fetch(t)::Matrix{T}
     end
   end
   mode === :incoherent && (afld .= sqrt.(afld))
@@ -232,6 +246,31 @@ end
 ### helper functions
 
 _ordered(a, b) = a < b ? (a, b) : (b, a)
+
+# effective number of parallel tasks (0 = auto)
+_ntasks(pm::RaySolver) = pm.ntasks ≤ 0 ? Threads.nthreads() : pm.ntasks
+
+# run f(i) for i ∈ 1:n over up to ntasks tasks; iterations are interleaved
+# across tasks for load balancing, since work per iteration is typically very
+# uneven; ntasks ≤ 1 gives a fully serial code path (AD-friendly)
+function _tforeach(f, n::Int, ntasks::Int)
+  nt = min(ntasks, n)
+  if nt ≤ 1
+    for i ∈ 1:n
+      f(i)
+    end
+  else
+    @sync for c ∈ 1:nt
+      Threads.@spawn for i ∈ c:nt:n
+        f(i)
+      end
+    end
+  end
+  nothing
+end
+
+# serial-aware version of tmap
+_tmap(f, x, ntasks) = ntasks ≤ 1 ? map(f, x) : tmap(f, x)
 
 function _isnearzero(a, b, c)
   (isnan(a) || isnan(b) || isnan(c)) && return false
@@ -598,23 +637,23 @@ function _arrivals_backscatter(pm::RaySolver, tx::AbstractAcousticSource, rx::Ab
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
   T2 = typeof(RayArrival(zero(T1), zero(Complex{T1}), 0, 0, zero(T1), zero(T1),
     Array{@NamedTuple{x::T1,y::T1,z::T1}}(undef, 0)))
-  erays = Channel{T2}(Inf)
-  _fan_search!(erays, pm, tx, collect(T1, θ), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths)
+  erays = _fan_search(T2, pm, tx, collect(T1, θ), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths)
   if pm.rmin < 0    # also insonify the left halfspace with a mirrored fan
-    _fan_search!(erays, pm, tx, collect(T1, rem2pi.(π .- θ, RoundNearest)), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths)
+    append!(erays, _fan_search(T2, pm, tx, collect(T1, rem2pi.(π .- θ, RoundNearest)), T1(rdom), T1(r_rx), T1(p2.z), ds, ztol, paths))
   end
-  close(erays)
-  sort(collect(erays); by=Base.Fix2(getfield, :t))
+  sort!(erays; by=Base.Fix2(getfield, :t))
 end
 
 # eigenray search over one launch-angle fan: find receiver-range crossings for
 # each launch angle, group by signature, and root-find on the per-signature
 # depth error using the same 3-way logic as the forward eigenray search
-function _fan_search!(erays, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths)
+function _fan_search(T2::Type, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths)
   T1 = eltype(θ)
-  crs_all = tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ)
+  ntasks = _ntasks(pm)
+  crs_all = _tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ, ntasks)
   allsigs = Set{NTuple{5,Int}}()
   foreach(crs -> union!(allsigs, _sigs(crs)), crs_all)
+  erays = T2[]
   for sig ∈ allsigs
     err = map(crs_all) do crs
       i = _findsig(crs, sig)
@@ -622,17 +661,18 @@ function _fan_search!(erays, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom
     end
     prob1 = IntervalNonlinearProblem{false}(_Δz_sig, T1.((θ[1], θ[1])), (pm, tx, rdom, r_rx, zrx, sig))
     prob2 = NonlinearProblem{false}(_Δz_sig, T1(θ[1]), (pm, tx, rdom, r_rx, zrx, sig))
-    Threads.@threads for i ∈ 1:length(θ)
+    results = [T2[] for _ ∈ 1:length(θ)]
+    _tforeach(length(θ), ntasks) do i
       if isapprox(err[i], 0; atol=pm.atol)
         # crossing already at receiver
         v = _crossing_arrival(pm, tx, θ[i], rdom, r_rx, sig, ds; paths)
-        v === nothing || put!(erays, v)
+        v === nothing || push!(results[i], v)
       elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
         # crossings bracket the receiver, so find a root in between...
         soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
         if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
           v = _crossing_arrival(pm, tx, soln.u, rdom, r_rx, sig, ds; paths)
-          v === nothing || put!(erays, v)
+          v === nothing || push!(results[i], v)
         end
       elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
         # at a turning point, so potentially two roots between i-2 and i, try and find both...
@@ -641,16 +681,17 @@ function _fan_search!(erays, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom
         if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
           θ₁ = soln.u
           v = _crossing_arrival(pm, tx, θ₁, rdom, r_rx, sig, ds; paths)
-          v === nothing || put!(erays, v)
+          v === nothing || push!(results[i], v)
           soln = solve(remake(prob2; u0=T1(θ[i-1] < θ₁ ? lims[2] : lims[1])); abstol=pm.atol)
           if successful_retcode(soln.retcode) && abs(soln.resid) < ztol &&
              (θ[i-1] < θ₁ ? θ₁ < soln.u < lims[2] : lims[1] < soln.u < θ₁)
             v = _crossing_arrival(pm, tx, soln.u, rdom, r_rx, sig, ds; paths)
-            v === nothing || put!(erays, v)
+            v === nothing || push!(results[i], v)
           end
         end
       end
     end
+    foreach(r -> append!(erays, r), results)
   end
-  nothing
+  erays
 end
