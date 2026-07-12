@@ -500,11 +500,25 @@ end
 # and evref reports which terminal event fired (0 = none).
 # Returns a 2-tuple of vectors containing distances along the ray, and
 # (r, z, ξ, ζ, t, p, q) values at each point.
+
+# a segment starting exactly on a knot makes the knot-crossing event fire at
+# s = 0 (its root coincides with the initial condition), which collides with
+# the knot step-size limiter and aborts the solve with dt → 0; start a hair
+# off the knot, in the ray's initial vertical direction (Dual-safe: the
+# comparisons use primal values, and the ternary keeps z0's own type)
+_nudge_off_knots(z0, θ, ::Nothing, εz) = z0
+function _nudge_off_knots(z0, θ, knots, εz)
+  isempty(knots.list) && return z0
+  minimum(k -> abs(z0 - k[1]), knots.list) < εz || return z0
+  z0 + (sin(θ) < 0 ? -εz : εz) * one(z0)
+end
+
 function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax, knots)
   a = pm.env.altimetry
   b = pm.env.bathymetry
   ss = pm.scatterers
   bs = pm.backscatter
+  z0 = _nudge_off_knots(z0, θ, knots, 1e-3 * pm.atol)
   cᵥ = value(pm.env.soundspeed, z0)
   u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
   # legacy tspan formula assumes forward-going rays (|θ| < π/2); with backscatter

@@ -456,3 +456,20 @@ end
   g2 = gradient(v -> ℳ₃(v, PiecewiseLinearSSP([v[1], v[2], v[3]])), AutoForwardDiff(), x)
   @test g1 ≈ g2 atol=1e-3
 end
+
+@testitem "raysolver-source-on-knot" begin
+  using UnderwaterAcoustics
+  # regression: a source depth coinciding exactly with an SSP knot used to make
+  # the knot-crossing event fire at s = 0, aborting the solve with dt → 0
+  env = UnderwaterEnvironment(
+    bathymetry = 100.0,
+    soundspeed = SampledField([1500.0, 1490.0, 1495.0]; z=[0.0, -50.0, -100.0]),
+    seabed = SandySilt
+  )
+  pm = RaySolver(env)
+  tx = AcousticSource(0.0, -50.0, 1000.0)          # exactly on the interior knot
+  arr = arrivals(pm, tx, AcousticReceiver(1000.0, -20.0); paths=false)
+  @test length(arr) > 0
+  x = acoustic_field(pm, tx, AcousticReceiverGrid2D(100.0:100.0:1000.0, -90.0:10.0:-10.0))
+  @test all(isfinite, abs.(x))
+end
