@@ -424,46 +424,85 @@ end
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
   @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-3
   @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-3
-  # sampled (piecewise linear) SSP: the analytic field-derivative path
-  # (including knot conventions) must produce the same gradients through a
-  # full trace as an equivalent hand-written piecewise-linear field that uses
-  # the generic AD fallback. (An FD reference is unusable here: with a
-  # refracting SSP, finite differences pick up the derivative of the ODE
-  # discretization error, which the default solver tolerance leaves at ~1e-3.)
-  struct PiecewiseLinearSSP{T} <: UnderwaterAcoustics.DepthDependent
-    v::Vector{T}
+  # sampled (piecewise linear) SSP: gradients of a full trace w.r.t. the SSP
+  # sample values, validated against an exact circular-arc tracer (rays in a
+  # piecewise-linear profile are circular arcs, so both the endpoint and its
+  # derivatives have closed forms; ForwardDiff through the closed form is
+  # exact). An FD reference is unusable here (it picks up the derivative of
+  # the ODE discretization error), and a hand-written DepthDependent SSP is
+  # not equivalent either: knot events fire only for SampledField, so the
+  # generic fallback integrates blindly across the ∂c kinks and its geometry
+  # does not converge with solver tolerance.
+  function exact_z(v::AbstractVector, zs, θ0, R)
+    T = promote_type(eltype(v), typeof(zs), typeof(θ0), typeof(R))
+    cz(z) = z ≥ -10 ? v[1] + (v[2] - v[1]) * z / -10 : v[2] + (v[3] - v[2]) * (z + 10) / -11
+    zofc(c, layer) = layer == 1 ? -10 * (c - v[1]) / (v[2] - v[1]) :
+                                  -11 * (c - v[2]) / (v[3] - v[2]) - 10
+    k = cos(θ0) / cz(T(zs))
+    z = T(zs)
+    u = T(sin(θ0))                       # sin of ray angle, positive up
+    r = zero(T)
+    for _ ∈ 1:100_000
+      layer = z > -10 ? 1 : z < -10 ? 2 : (u < 0 ? 2 : 1)
+      g = layer == 1 ? (v[2] - v[1]) / -10 : (v[3] - v[2]) / -11
+      slope = -k * g                     # du/dr within the layer (circular arc)
+      zb = u > 0 ? (layer == 1 ? zero(T) : T(-10)) :
+                   (layer == 1 ? T(-10) : T(-20))
+      s2 = 1 - (k * cz(zb))^2
+      ub = s2 ≥ 0 ? T(sign(u)) * sqrt(s2) : T(NaN)
+      Δrb = (ub - u) / slope
+      Δrt = -u / slope                   # range to the turning point (u = 0)
+      if isnan(ub) || Δrb < 0 || (Δrt > 0 && Δrt < Δrb)
+        if r + 2Δrt ≥ R                  # turns inside the layer (symmetric arc)
+          ur = u + slope * (R - r)
+          return zofc(sqrt(1 - ur^2) / k, layer)
+        end
+        r += 2Δrt
+        u = -u
+        continue
+      end
+      if r + Δrb ≥ R
+        ur = u + slope * (R - r)
+        return zofc(sqrt(1 - ur^2) / k, layer)
+      end
+      r += Δrb
+      u = ub
+      z = zb
+      (z == 0 || z == -20) && (u = -u)   # specular reflection
+    end
+    error("no convergence")
   end
-  function (s::PiecewiseLinearSSP)(pos::UnderwaterAcoustics.XYZ)
-    z = clamp(pos.z, -20.0, 0.0)   # match SampledField's Flat() extrapolation
-    z ≥ -10.0 ? s.v[1] + (s.v[2] - s.v[1]) * z / -10.0 :
-                s.v[2] + (s.v[3] - s.v[2]) * (z + 10.0) / -10.0
-  end
-  Base.minimum(s::PiecewiseLinearSSP) = minimum(s.v)
-  Base.maximum(s::PiecewiseLinearSSP) = maximum(s.v)
-  # observable: ray endpoint depth for a fixed launch angle — smooth in the
-  # SSP samples, so it isolates the derivative path from eigenray-search and
-  # coherent-summation noise (rounding differences between the two SSP
-  # implementations still perturb the adaptive ODE steps, hence atol 1e-3)
-  function ℳ₃(v, ssp)
-    env = UnderwaterEnvironment(bathymetry = 20.0, soundspeed = ssp, seabed = SandySilt)
+  function ℳ₃(v)
+    env = UnderwaterEnvironment(bathymetry = 20.0,
+      soundspeed = SampledField([v[1], v[2], v[3]]; z=[0.0, -10.0, -21.0]),
+      seabed = SandySilt)
     pm = RaySolver(env)
     tx = AcousticSource((x=0.0, z=-5.0), 5000.0)
     AcousticRayTracers._trace(pm, tx, -deg2rad(30), 100.0)[1].path[end].z
   end
   import AcousticRayTracers
   x = [1500.0, 1490.0, 1510.0]
-  g1 = gradient(v -> ℳ₃(v, SampledField([v[1], v[2], v[3]]; z=[0.0, -10.0, -20.0])), AutoForwardDiff(), x)
-  g2 = gradient(v -> ℳ₃(v, PiecewiseLinearSSP([v[1], v[2], v[3]])), AutoForwardDiff(), x)
-  @test g1 ≈ g2 atol=1e-3
+  # the SSP domain extends below the seafloor: with the last knot exactly at
+  # the bottom, Interpolations.jl errors on Dual-indexed evaluation at the
+  # domain edge (JuliaMath/Interpolations#645), and reflections there carry a
+  # small systematic geometry offset (issue #29)
+  @test ℳ₃(x) ≈ exact_z(x, -5.0, -deg2rad(30), 100.0) atol=1e-3
+  g = gradient(ℳ₃, AutoForwardDiff(), x)
+  ge = gradient(v -> exact_z(v, -5.0, -deg2rad(30), 100.0), AutoForwardDiff(), x)
+  @test g ≈ ge atol=1e-3
 end
 
 @testitem "raysolver-source-on-knot" begin
   using UnderwaterAcoustics
   # regression: a source depth coinciding exactly with an SSP knot used to make
   # the knot-crossing event fire at s = 0, aborting the solve with dt → 0
+  # the SSP domain extends below the seafloor with a slope-continuous node
+  # (an edge knot at the bottom trips JuliaMath/Interpolations#645 on
+  # Dual-indexed edge evaluation; the added node introduces no new gradient
+  # discontinuity)
   env = UnderwaterEnvironment(
     bathymetry = 100.0,
-    soundspeed = SampledField([1500.0, 1490.0, 1495.0]; z=[0.0, -50.0, -100.0]),
+    soundspeed = SampledField([1500.0, 1490.0, 1495.0, 1496.0]; z=[0.0, -50.0, -100.0, -110.0]),
     seabed = SandySilt
   )
   pm = RaySolver(env)
