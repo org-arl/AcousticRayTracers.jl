@@ -151,6 +151,20 @@ end
   @test abs(bck[1].ϕ) < abs(fwd[1].ϕ)               # weaker than the direct arrival
   # all eigenray paths (forward and backscattered) must end at the receiver
   @test all(a -> abs(a.path[end].x - 40) < 0.5 && abs(a.path[end].z + 10) < 0.5, arr2)
+  # with default rmax (= query range), the wall at 85-100 m is outside the
+  # domain and produces no echoes
+  arr3 = arrivals(RaySolver(env2; backscatter=true), tx2, rx2)
+  @test count(a -> abs(a.θᵣ) > π/2, arr3) == 0
+  # wall to the LEFT of the source: echoes require rmin < 0 (mirrored fan)
+  bathy4 = SampledField([2, 20, 20]; x=[-100, -80, 200])
+  env4 = UnderwaterEnvironment(bathymetry=bathy4, seabed=RigidBoundary, soundspeed=1500.0)
+  tx4 = AcousticSource(0.0, -10.0, 1000.0)
+  rx4 = AcousticReceiver(50.0, -10.0)
+  arr4a = arrivals(RaySolver(env4; backscatter=true), tx4, rx4)
+  arr4b = arrivals(RaySolver(env4; backscatter=true, rmin=-100.0, rmax=100.0), tx4, rx4)
+  @test count(a -> abs(a.θₛ) > π/2, arr4a) == 0
+  @test count(a -> abs(a.θₛ) > π/2, arr4b) > 0
+  @test all(a -> abs(a.path[end].x - 50) < 0.5 && abs(a.path[end].z + 10) < 0.5, arr4b)
 end
 
 @testitem "∂raysolver-backscatter" begin
@@ -179,14 +193,14 @@ end
       scatterers = (Scatterer(Ellipse(50.0, -20.0, 2.0, 2.0), RigidBoundary),))
     tx = AcousticSource(0.0, -20.0, 5000.0)
     rx = AcousticReceiver(10.0, -20.0)
-    pm = RaySolver(env; backscatter=true)
+    pm = RaySolver(env; backscatter=true, rmax=60.0)
     arr = arrivals(pm, tx, rx)
     bsc = filter(a -> abs(a.θᵣ) > π/2, arr)
     @test any(a -> isapprox(a.t, 86/1500; atol=1e-3), bsc)
     # pressure-release scatterer: backscattered arrival flips phase by π
     env2 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
       scatterers = (Scatterer(Ellipse(50.0, -20.0, 2.0, 2.0), PressureReleaseBoundary),))
-    arr2 = arrivals(RaySolver(env2; backscatter=true), tx, rx)
+    arr2 = arrivals(RaySolver(env2; backscatter=true, rmax=60.0), tx, rx)
     bsc2 = filter(a -> abs(a.θᵣ) > π/2, arr2)
     a1 = bsc[argmin([abs(a.t - 86/1500) for a ∈ bsc])]
     a2 = bsc2[argmin([abs(a.t - 86/1500) for a ∈ bsc2])]
@@ -194,13 +208,13 @@ end
     # anti-tunneling: a small scatterer (0.5 m radius) must still be detected
     env3 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
       scatterers = (Scatterer(Ellipse(50.0, -20.0, 0.5, 0.5), RigidBoundary),))
-    arr3 = arrivals(RaySolver(env3; backscatter=true), tx, rx)
+    arr3 = arrivals(RaySolver(env3; backscatter=true, rmax=60.0), tx, rx)
     @test any(a -> abs(a.θᵣ) > π/2 && isapprox(a.t, (49.5 + 39.5)/1500; atol=1e-3), arr3)
     # shadow: coherent field behind the scatterer drops relative to no-scatterer case
     env4 = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0)
     rx2 = AcousticReceiver(60.0, -20.0)
     tl_free = transmission_loss(RaySolver(env4), tx, rx2)
-    tl_shad = transmission_loss(RaySolver(env; backscatter=true), tx, rx2)
+    tl_shad = transmission_loss(RaySolver(env; backscatter=true, rmax=60.0), tx, rx2)
     @test tl_shad > tl_free
     # AD through scatterer geometry
     using DifferentiationInterface
@@ -209,7 +223,7 @@ end
     function ℳ((sx, sz, sa))
       envg = UnderwaterEnvironment(bathymetry = 40.0, soundspeed = 1500.0,
         scatterers = (Scatterer(Ellipse(sx, sz, sa, sa), RigidBoundary),))
-      pmg = RaySolver(envg; backscatter=true)
+      pmg = RaySolver(envg; backscatter=true, rmax=60.0)
       transmission_loss(pmg, AcousticSource((x=0.0, z=-20.0), 5000.0), AcousticReceiver((x=10.0, z=-20.0)))
     end
     x = [50.0, -20.0, 2.0]
