@@ -5,6 +5,7 @@ import DiffEqCallbacks: StepsizeLimiter
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!, remake
 import ForwardDiff: derivative
+import ForwardDiff
 import StaticArrays: SA, SVector
 
 # scatterers from the environment are wrapped into a ScattererSet at solver
@@ -85,10 +86,15 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   _check2d([tx], [rx])
   pm.backscatter && return _arrivals_backscatter(pm, tx, rx; paths, ztol)
   p2 = location(rx)
+  p1 = location(tx)
+  R = abs(p2.x - p1.x)
+  # the interval root-solve tolerance is in launch-angle space, but eigenrays are
+  # accepted on the depth residual (ztol, in m); since dΔz/dθ grows ∝ range, the
+  # angle tolerance must shrink ∝ 1/range or all roots at long range carry
+  # residuals ≫ ztol and are rejected
+  θtol = pm.atol / max(ForwardDiff.value(R), 1.0)   # plain float: solver control, not differentiated
   nbeams = pm.nbeams
   if nbeams == 0
-    p1 = location(tx)
-    R = abs(p2.x - p1.x)
     h = maximum(pm.env.bathymetry)
     nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
@@ -112,7 +118,7 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
       push!(erays[i], v)
     elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
       # rays bracket the receiver, so find a root in between...
-      soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
+      soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=θtol)
       if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
         push!(erays[i], _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
       end
@@ -649,6 +655,7 @@ end
 # depth error using the same 3-way logic as the forward eigenray search
 function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths) where T2
   T1 = eltype(θ)
+  θtol = pm.atol / max(ForwardDiff.value(abs(r_rx)), 1.0)   # see arrivals: angle tol scales ∝ 1/range
   ntasks = _ntasks(pm)
   crs_all = _tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ, ntasks)
   allsigs = Set{NTuple{5,Int}}()
@@ -669,7 +676,7 @@ function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, 
         v === nothing || push!(results[i], v)
       elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
         # crossings bracket the receiver, so find a root in between...
-        soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=pm.atol)
+        soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=θtol)
         if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
           v = _crossing_arrival(pm, tx, soln.u, rdom, r_rx, sig, ds; paths)
           v === nothing || push!(results[i], v)
