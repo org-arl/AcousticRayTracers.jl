@@ -294,6 +294,84 @@ end
   end
 end
 
+@testitem "raysolver-boundary-curvature" begin
+  using UnderwaterAcoustics
+  if !isdefined(UnderwaterAcoustics, :∂)
+    # awaiting the UnderwaterAcoustics.jl field derivative API
+    @test_skip false
+  else
+    # ray-tube consistency: for a point source, the dynamic ray tracing q at
+    # the end of a ray equals the perpendicular ray-tube width per unit launch
+    # angle at fixed range. This must hold across
+    # reflections off curved boundaries (curvature term) and off flat/curved
+    # boundaries in a soundspeed-gradient medium (Müller cn/cs jump terms).
+    import AcousticRayTracers
+    struct ParabolicBathy <: UnderwaterAcoustics.PositionDependent
+      D::Float64    # depth at x = xm
+      xm::Float64
+      R::Float64    # radius of curvature (> 0: seamount, < 0: basin)
+    end
+    (b::ParabolicBathy)(pos::XYZ) = b.D + (pos.x - b.xm)^2 / (2 * b.R)
+    Base.minimum(b::ParabolicBathy) = b.R > 0 ? b.D : b.D - 100.0
+    Base.maximum(b::ParabolicBathy) = b.R > 0 ? b.D + 100.0 : b.D
+    struct ParabolicSurf <: UnderwaterAcoustics.PositionDependent
+      a::Float64    # altitude at x = xm
+      xm::Float64
+      R::Float64
+    end
+    (s::ParabolicSurf)(pos::XYZ) = s.a + (pos.x - s.xm)^2 / (2 * s.R)
+    Base.minimum(s::ParabolicSurf) = min(s.a, s.a + 100.0^2 / (2 * s.R))
+    Base.maximum(s::ParabolicSurf) = max(s.a, s.a + 100.0^2 / (2 * s.R))
+    function q_vs_raytube(env, θ; rmax=100.0, δ=1e-4)
+      pm = RaySolver(env)
+      tx = AcousticSource(0.0, -20.0, 5000.0)
+      trace(ϕ) = AcousticRayTracers._trace(pm, tx, ϕ, rmax; aux=true)
+      arr, aux, _ = trace(θ)
+      @test arr.path[end].x ≈ rmax atol=0.1
+      q = aux[end][2]
+      z(ϕ) = trace(ϕ)[1].path[end].z
+      dzdθ = (z(θ + δ) - z(θ - δ)) / 2δ
+      # ray-centred normal convention makes q = -cos(θᵣ) ∂z/∂θ₀
+      q, -cos(arr.θᵣ) * dzdθ
+    end
+    # curved bottom (seamount, convex into water), isovelocity
+    env = UnderwaterEnvironment(bathymetry=ParabolicBathy(60.0, 50.0, 200.0),
+      soundspeed=1500.0, seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # curved bottom (basin, concave into water), isovelocity
+    env = UnderwaterEnvironment(bathymetry=ParabolicBathy(60.0, 50.0, -500.0),
+      soundspeed=1500.0, seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # flat bottom, soundspeed gradient (tests the cn/cs jump terms alone)
+    env = UnderwaterEnvironment(bathymetry=60.0,
+      soundspeed=SampledField([1540.0, 1500.0]; z=[0.0, -60.0]), seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # curved bottom + soundspeed gradient (both corrections together); the SSP
+    # spans deeper than the bottom so that rays never cross the SSP knot, where
+    # the gradient discontinuity would need a (unimplemented) transmission
+    # correction to p that is unrelated to boundary reflections
+    env = UnderwaterEnvironment(bathymetry=ParabolicBathy(60.0, 50.0, 200.0),
+      soundspeed=SampledField([1540.0, 1490.0]; z=[0.0, -75.0]), seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # flat surface, soundspeed gradient (cn/cs jump terms, top reflection)
+    env = UnderwaterEnvironment(bathymetry=200.0,
+      soundspeed=SampledField([1540.0, 1500.0]; z=[0.0, -60.0]), seabed=RigidBoundary)
+    # (looser tolerance: the FD reference is limited by ODE solver error near
+    # the post-reflection restart at the surface)
+    q, qfd = q_vs_raytube(env, deg2rad(30))
+    @test q ≈ qfd rtol=5e-3
+    # curved surface (local sag at x = 50, convex into water), isovelocity
+    env = UnderwaterEnvironment(bathymetry=200.0, altimetry=ParabolicSurf(-0.5, 50.0, 400.0),
+      soundspeed=1500.0, seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, deg2rad(30))
+    @test q ≈ qfd rtol=1e-3
+  end
+end
+
 @testitem "∂raysolver" begin
   using UnderwaterAcoustics
   using DifferentiationInterface
@@ -320,4 +398,35 @@ end
   ∇ℳ₂ = gradient(ℳ₂, fd, x)
   @test gradient(ℳ₁, AutoForwardDiff(), x) ≈ ∇ℳ₁ atol=1e-3
   @test gradient(ℳ₂, AutoForwardDiff(), x) ≈ ∇ℳ₂ atol=1e-3
+  # sampled (piecewise linear) SSP: the analytic field-derivative path
+  # (including knot conventions) must produce the same gradients through a
+  # full trace as an equivalent hand-written piecewise-linear field that uses
+  # the generic AD fallback. (An FD reference is unusable here: with a
+  # refracting SSP, finite differences pick up the derivative of the ODE
+  # discretization error, which the default solver tolerance leaves at ~1e-3.)
+  struct PiecewiseLinearSSP{T} <: UnderwaterAcoustics.DepthDependent
+    v::Vector{T}
+  end
+  function (s::PiecewiseLinearSSP)(pos::UnderwaterAcoustics.XYZ)
+    z = clamp(pos.z, -20.0, 0.0)   # match SampledField's Flat() extrapolation
+    z ≥ -10.0 ? s.v[1] + (s.v[2] - s.v[1]) * z / -10.0 :
+                s.v[2] + (s.v[3] - s.v[2]) * (z + 10.0) / -10.0
+  end
+  Base.minimum(s::PiecewiseLinearSSP) = minimum(s.v)
+  Base.maximum(s::PiecewiseLinearSSP) = maximum(s.v)
+  # observable: ray endpoint depth for a fixed launch angle — smooth in the
+  # SSP samples, so it isolates the derivative path from eigenray-search and
+  # coherent-summation noise (rounding differences between the two SSP
+  # implementations still perturb the adaptive ODE steps, hence atol 1e-3)
+  function ℳ₃(v, ssp)
+    env = UnderwaterEnvironment(bathymetry = 20.0, soundspeed = ssp, seabed = SandySilt)
+    pm = RaySolver(env)
+    tx = AcousticSource((x=0.0, z=-5.0), 5000.0)
+    AcousticRayTracers._trace(pm, tx, -deg2rad(30), 100.0)[1].path[end].z
+  end
+  import AcousticRayTracers
+  x = [1500.0, 1490.0, 1510.0]
+  g1 = gradient(v -> ℳ₃(v, SampledField([v[1], v[2], v[3]]; z=[0.0, -10.0, -20.0])), AutoForwardDiff(), x)
+  g2 = gradient(v -> ℳ₃(v, PiecewiseLinearSSP([v[1], v[2], v[3]])), AutoForwardDiff(), x)
+  @test g1 ≈ g2 atol=1e-3
 end
