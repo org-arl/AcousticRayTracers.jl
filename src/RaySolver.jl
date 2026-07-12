@@ -4,7 +4,6 @@ import OrdinaryDiffEqRosenbrock: Rosenbrock23
 import DiffEqCallbacks: StepsizeLimiter
 import NonlinearSolve: IntervalNonlinearProblem, NonlinearProblem
 import SciMLBase: successful_retcode, terminate!, remake
-import ForwardDiff: derivative
 import ForwardDiff
 import StaticArrays: SA, SVector
 
@@ -410,8 +409,8 @@ end
 # prepare to trace a ray segment
 function _prepare_trace(T, pm)
   c = z -> value(pm.env.soundspeed, z)
-  ∂c = z -> derivative(c, z)
-  ∂²c = z -> derivative(∂c, z)
+  ∂c = z -> ∂(pm.env.soundspeed, z, :z)
+  ∂²c = z -> ∂(pm.env.soundspeed, z, :z, :z)
   ODEProblem{false}(_∂u, zeros(SVector{7,T}), (zero(T), one(T)), (c, ∂c, ∂²c))
 end
 
@@ -458,6 +457,28 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
     soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cbs)
   end
   (soln.t, soln.u)
+end
+
+# dynamic ray tracing correction to the spreading rate p (= qp) for reflection
+# off a (possibly curved) boundary in a medium with a soundspeed gradient
+# [COA (3.123-3.128); Müller, Geoph. J. R.A.S. 79 (1984); BELLHOP Reflect2D].
+# t̂ is the incident unit ray tangent, n̂ the boundary unit normal pointing into
+# the water, κ the boundary curvature (positive where the boundary is convex
+# toward the water), and gc the soundspeed gradient (∂c/∂x, ∂c/∂z) at the
+# reflection point. The correction diverges at grazing incidence and is
+# skipped for sinθg ≤ 1e-3, consistent with the eigenray search tolerances.
+function _reflect_pq(qp, q, c, t̂, n̂, κ, gc)
+  Th = dot(t̂, n̂) / c                    # normal component of the 1/c-scaled tangent
+  abs(Th) * c ≤ 1e-3 && return qp
+  Tg = (t̂[1] * n̂[2] - t̂[2] * n̂[1]) / c  # tangential component (t̂b = (n̂z, -n̂x))
+  t̂′ = t̂ - 2 * dot(t̂, n̂) * n̂
+  rayn = SA[-t̂[2], t̂[1]]                # ray-centred unit normals
+  rayn′ = SA[t̂′[2], -t̂′[1]]             # (reflected frame has opposite sense)
+  cnjump = -dot(gc, rayn′ - rayn)
+  csjump = -dot(gc, t̂′ - t̂)
+  RM = Tg / Th
+  RN = -2κ / (c^2 * Th) + RM * (2 * cnjump - RM * csjump) / c^2
+  qp + q * RN
 end
 
 # trace a ray starting at tx1 with angle θ until it reaches rmax. ds controls the
@@ -548,24 +569,35 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
       ρ = value(pm.env.density, (r, 0.0, z))
       c = value(pm.env.soundspeed, (r, 0.0, z))
       A *= reflection_coef(sca.boundary, f, asin(sinθg), ρ, c)
-      # dynamic ray tracing correction for reflection off a curved boundary
-      # [COA (3.123-3.128)]; skipped near grazing where the correction diverges
-      sinθg > 1e-3 && (qp += q * 2 * hit.curvature / (c * sinθg))
+      gz = ∂(pm.env.soundspeed, z, :z)
+      qp = _reflect_pq(qp, q, c, t̂, n̂, hit.curvature, SA[zero(gz), gz])
       guard = 2 * one(T) * pm.atol
     elseif ev == 1 && isapprox(z, zmax; atol=1e-3)   # hit the surface
       s += 1
       ρ = value(pm.env.density, (r, 0.0, 0.0))
       c = value(pm.env.soundspeed, (r, 0.0, 0.0))
       A *= reflection_coef(pm.env.surface, f, π/2 - θ, ρ, c)
-      α = atan(derivative(x -> value(pm.env.altimetry, (x, 0.0, 0.0)), r))
-      θ = -θ + 2α
+      a′ = ∂(pm.env.altimetry, (r, 0.0, 0.0), :x)
+      a″ = ∂(pm.env.altimetry, (r, 0.0, 0.0), :x, :x)
+      m = √(1 + a′^2)
+      κ = a″ / m^3                       # positive: boundary convex into the water
+      n̂ = SA[a′, -one(a′)] / m           # unit normal pointing into the water
+      gz = ∂(pm.env.soundspeed, z, :z)
+      qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
+      θ = -θ + 2atan(a′)
     elseif ev == 2 && isapprox(z, zmin; atol=1e-3)   # hit the bottom
       b += 1
       ρ = value(pm.env.density, (r, 0.0, z))
       c = value(pm.env.soundspeed, (r, 0.0, z))
       A *= reflection_coef(pm.env.seabed, f, π/2 + θ, ρ, c)
-      α = atan(derivative(x -> value(pm.env.bathymetry, (x, 0.0, 0.0)), r))
-      θ = -θ - 2α
+      d′ = ∂(pm.env.bathymetry, (r, 0.0, 0.0), :x)
+      d″ = ∂(pm.env.bathymetry, (r, 0.0, 0.0), :x, :x)
+      m = √(1 + d′^2)
+      κ = d″ / m^3                       # positive: boundary convex into the water
+      n̂ = SA[d′, one(d′)] / m            # unit normal pointing into the water
+      gz = ∂(pm.env.soundspeed, z, :z)
+      qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
+      θ = -θ - 2atan(d′)
     else
       break
     end
