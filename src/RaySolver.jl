@@ -208,31 +208,36 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
         # neighborhood must cover the clamped minimum beam width (≤ πλ) too
         max(4 * max(abs(q1), abs(q2)) * δθ, 4π * cₛ / f)
       )
-      for j ∈ xi, k ∈ zi                                # loop over the subset
-        rx = rxs[j,k].pos
-        rxpos = SA[rx.x, rx.z]
-        α = dot(rxpos - pos1, vec12) / vec12_mag2
-        0 ≤ α < 1 || continue                           # rx outside of ray segment
-        q = q1 + α * (q2 - q1)                          # spreading factor at cpa
-        t = t1 + α * (t2 - t1)                          # time at cpa
-        W = abs(q * δθ)                                 # beam width at cpa [COA (3.74)]
-        # in incoherent mode, clamp beam width from below near caustics (q → 0
-        # makes the beam infinitesimally narrow and its amplitude blow up);
-        # same rule (and units quirk) as BELLHOP's InfluenceGeoGaussianCart:
-        # min(0.2 f t, π λ). Not applied in coherent mode, where beams wider
-        # than the multipath image separation would blur interference fringes.
-        mode === :incoherent && (W = max(W, min(0.2 * f * t, π * cₛ / f)))
-        cpa = pos1 + α * vec12                          # closest point of approach
-        cpa[1] > 0 || continue                          # no deposit at/behind the r=0 axis
-        n = norm(cpa - rxpos)                           # normal distance from ray to rx
-        n < 4W || continue                              # rx too far from ray segment
-        A = C1 * sqrt(C2 / (cpa[1] * W))                # [COA (3.76)]
-        if mode === :coherent
-          P = A * exp(-(n / W)^2) * cispi(2f * t)       # [COA (3.72), COA (3.75)]
-        else
-          P = complex(abs2(A * exp(-(n / W)^2)), 0.0)
+      for j ∈ xi                                        # loop over the subset
+        zbot = -value(pm.env.bathymetry, (rxs[j,1].pos.x, 0.0, 0.0))
+        ztop = value(pm.env.altimetry, (rxs[j,1].pos.x, 0.0, 0.0))
+        for k ∈ zi
+          rx = rxs[j,k].pos
+          zbot ≤ rx.z ≤ ztop || continue                # no deposit outside the water column
+          rxpos = SA[rx.x, rx.z]
+          α = dot(rxpos - pos1, vec12) / vec12_mag2
+          0 ≤ α < 1 || continue                         # rx outside of ray segment
+          q = q1 + α * (q2 - q1)                        # spreading factor at cpa
+          t = t1 + α * (t2 - t1)                        # time at cpa
+          W = abs(q * δθ)                               # beam width at cpa [COA (3.74)]
+          # in incoherent mode, clamp beam width from below near caustics (q → 0
+          # makes the beam infinitesimally narrow and its amplitude blow up);
+          # same rule (and units quirk) as BELLHOP's InfluenceGeoGaussianCart:
+          # min(0.2 f t, π λ). Not applied in coherent mode, where beams wider
+          # than the multipath image separation would blur interference fringes.
+          mode === :incoherent && (W = max(W, min(0.2 * f * t, π * cₛ / f)))
+          cpa = pos1 + α * vec12                        # closest point of approach
+          cpa[1] > 0 || continue                        # no deposit at/behind the r=0 axis
+          n = norm(cpa - rxpos)                         # normal distance from ray to rx
+          n < 4W || continue                            # rx too far from ray segment
+          A = C1 * sqrt(C2 / (cpa[1] * W))              # [COA (3.76)]
+          if mode === :coherent
+            P = A * exp(-(n / W)^2) * cispi(2f * t)     # [COA (3.72), COA (3.75)]
+          else
+            P = complex(abs2(A * exp(-(n / W)^2)), 0.0)
+          end
+          afld[j,k] += P
         end
-        afld[j,k] += P
       end
     end
     afld
@@ -371,39 +376,111 @@ end
 
 # events: 1 = surface, 2 = bottom, 3 = max range, 4 = ray turned back (legacy) or
 # exited past the source (backscatter), 5 = scatterer hit, 6 = receiver range
-# crossing (recorded, not terminal). Inert slots hold one(u[1]) so they never fire
-# and preserve the element type (dual numbers).
-function _check_ray!(out, u, s, integrator, a, b, rmax, rmin, backscatter, ss, δ, guard, r_rx)
+# crossing (recorded, not terminal), 6+k = crossing of the k-th soundspeed-
+# gradient discontinuity (transmission correction applied, not terminal). Inert
+# slots hold one(u[1]) so they never fire and preserve the element type (dual
+# numbers).
+function _check_ray!(out, u, s, integrator, a, b, rmax, rmin, backscatter, ss, δ, guard, r_rx, knots)
   out[1] = value(a, (u[1], 0.0, 0.0)) - u[2]    # surface reflection
   out[2] = u[2] + value(b, (u[1], 0.0, 0.0))    # bottom reflection
   out[3] = rmax - u[1]                          # maximum range
   out[4] = backscatter ? u[1] - rmin + δ : u[3] # exit domain left / ray turned back
   out[5] = ss === nothing || s < guard ? one(u[1]) : _mindist(ss, u[1], u[2]) - δ
   out[6] = isnan(r_rx) ? one(u[1]) : u[1] - r_rx
+  if knots !== nothing
+    for k ∈ eachindex(knots.list)
+      out[6+k] = u[2] - knots.list[k][1]
+    end
+  end
 end
 
 # handle a fired ray event: event 6 (receiver-range crossing) is recorded and
-# integration continues; any other event terminates the segment and its index is
-# reported via evref. Depending on the DiffEqBase version, ndx is either the
-# event index or a vector of simultaneous event flags (0 = not fired, ±1 = fired)
-function _ray_event!(i, ndx::Integer, crossbuf, evref)
+# integration continues; events 7+ (soundspeed-gradient discontinuity crossings)
+# apply the transmission correction to p and continue; any other event terminates
+# the segment and its index is reported via evref. Depending on the DiffEqBase
+# version, ndx is either the event index or a vector of simultaneous event flags
+# (0 = not fired, ±1 = fired). If a terminal event fires simultaneously with a
+# knot crossing (e.g. a bounce off a boundary at knot depth), the ray reflects
+# rather than transmits, so no correction is applied.
+function _ray_event!(i, ndx::Integer, crossbuf, evref, knots, a, b)
   if ndx == 6
     push!(crossbuf, (i.t, i.u))
+  elseif ndx > 6
+    _knot_jump!(i, knots.list[ndx-6], a, b, evref)
   else
     evref[] = Int(ndx)
     terminate!(i)
   end
 end
 
-function _ray_event!(i, ndx::AbstractVector, crossbuf, evref)
+function _ray_event!(i, ndx::AbstractVector, crossbuf, evref, knots, a, b)
   length(ndx) ≥ 6 && ndx[6] != 0 && push!(crossbuf, (i.t, i.u))
   for k ∈ 1:min(length(ndx), 5)
     if ndx[k] != 0
       evref[] = k
       terminate!(i)
-      break
+      return
     end
   end
+  for k ∈ 7:length(ndx)
+    ndx[k] != 0 && _knot_jump!(i, knots.list[k-6], a, b, evref)
+  end
+end
+
+# depths at which the soundspeed gradient is discontinuous, for piecewise-linear
+# (SampledField ... interp=Linear()) depth-only SSPs. The dynamic ray tracing
+# equations integrate p using ∂²c/∂z², which contains a delta at such depths that
+# the ODE integration cannot see; a transmission correction to p is applied there
+# instead (see _knot_jump!). Returns nothing (no events needed) for smooth
+# profiles. list entries are (z_k, g₋, g₊, c_k) with g₋/g₊ the SSP slopes
+# below/above z_k (zero outside the sampled domain, per flat extrapolation) and
+# c_k = c(z_k); κ bounds the ray curvature (max |∂c|/c) and cmax the soundspeed,
+# both used by the knot step-size limiter. Knots at or outside the boundaries
+# are excluded: rays cannot cross them.
+function _gradient_discontinuities(env)
+  ss = env.soundspeed
+  ss isa SampledFieldZ || return nothing
+  ss.interp isa UnderwaterAcoustics.Linear || return nothing
+  zs = sort([Float64(z) for z ∈ ss.zrange])
+  cs = [value(ss, z) for z ∈ zs]
+  n = length(zs)
+  slopes = [(cs[k+1] - cs[k]) / (zs[k+1] - zs[k]) for k ∈ 1:n-1]
+  zmax = minimum(env.altimetry) - 1e-3
+  zmin = -maximum(env.bathymetry) + 1e-3
+  list = [(zs[k], k == 1 ? zero(slopes[1]) : slopes[k-1],
+           k == n ? zero(slopes[1]) : slopes[k], cs[k]) for k ∈ 1:n]
+  filter!(list) do (z, g₋, g₊, _)
+    zmin < z < zmax && !(g₋ ≈ g₊)
+  end
+  isempty(list) && return nothing
+  (; list, κ=maximum(abs, slopes) / minimum(cs), cmax=maximum(cs))
+end
+
+# apply the transmission correction to the spreading rate p when a ray crosses a
+# soundspeed-gradient discontinuity at depth z_k: integrating the delta in
+# dp/ds = -∂²c ξ² q through dz/ds = c ζ gives Δp = -q ξ² Δ(∂c/∂z) / (c |ζ|),
+# independent of travel direction. Diverges at grazing (ray turning at the knot);
+# skipped for |sin θ| ≤ 1e-3, consistent with _reflect_pq. If the crossing point
+# lies at or beyond a boundary (a knot depth can coincide with the seabed or
+# surface, e.g. at a seamount top), the ray reflects rather than transmits:
+# terminate with the corresponding boundary event instead, as the restart could
+# otherwise land outside the water column and tunnel through the boundary.
+function _knot_jump!(i, (z_k, g₋, g₊, c_k), a, b, evref)
+  u = i.u   # (r, z, ξ, ζ, t, p, q)
+  if u[2] ≥ value(a, (u[1], 0.0, 0.0))
+    evref[] = 1
+    terminate!(i)
+    return
+  elseif u[2] ≤ -value(b, (u[1], 0.0, 0.0))
+    evref[] = 2
+    terminate!(i)
+    return
+  end
+  ξ, ζ, q = u[3], u[4], u[7]
+  abs(ζ) * c_k ≤ 1e-3 && return
+  Δp = -q * ξ^2 * (g₊ - g₋) / (c_k * abs(ζ))
+  i.u = Base.setindex(u, u[6] + Δp, 6)
+  nothing
 end
 
 # prepare to trace a ray segment
@@ -423,7 +500,7 @@ end
 # and evref reports which terminal event fired (0 = none).
 # Returns a 2-tuple of vectors containing distances along the ray, and
 # (r, z, ξ, ζ, t, p, q) values at each point.
-function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax)
+function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax, knots)
   a = pm.env.altimetry
   b = pm.env.bathymetry
   ss = pm.scatterers
@@ -437,9 +514,10 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
   tspan = (zero(T), span)
   prob = remake(prob; u0, tspan)
   δ = one(T) * pm.atol
+  nk = knots === nothing ? 0 : length(knots.list)
   cb = VectorContinuousCallback(
-    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, rmin, bs, ss, δ, guard, r_rx),
-    (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref), 6;
+    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, rmin, bs, ss, δ, guard, r_rx, knots),
+    (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref, knots, a, b), 6 + nk;
     rootfind = true
   )
   if ss === nothing
@@ -450,6 +528,22 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
     # scatterer without the event function bracketing the surface (sphere tracing)
     limiter = StepsizeLimiter((u, pp, s) -> max(_mindist(ss, u[1], u[2]), δ); safety_factor=9//10, cached_dtcache=zero(T))
     cbs = CallbackSet(limiter, cb)
+  end
+  if knots !== nothing
+    # the ODE error estimator is blind to the ∂c discontinuity at SSP knots, so
+    # an integration step straddling a knot carries an unestimated error; shrink
+    # steps approaching a knot so that the straddling step is at most δ long.
+    # Over an arc s, |Δz| ≤ s (sinθ₀ + κ s) with κ = max |dθ/ds| = max |∂c|/c,
+    # so a step of the positive root of s (sinθ₀ + κ s) = d cannot cross a knot
+    # at vertical distance d (sinθ₀ overestimated via cmax for safety)
+    klist, κ, cmax = knots.list, knots.κ, knots.cmax
+    klimiter = StepsizeLimiter(
+      (u, pp, s) -> begin
+        d = minimum(k -> abs(u[2] - k[1]), klist)
+        sinθ = abs(u[4]) * cmax
+        max((√(sinθ^2 + 4κ * d) - sinθ) / (2κ), δ)
+      end; safety_factor=9//10, cached_dtcache=zero(T))
+    cbs = CallbackSet(klimiter, cbs)
   end
   if ds ≤ 0
     soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cbs)
@@ -512,11 +606,12 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   q = zero(T)           # spreading factor
   qp = one(T) / c₀      # spreading rate
   guard = zero(T)       # arc length over which scatterer detection is suppressed
+  knots = _gradient_discontinuities(pm.env)
   while true
     empty!(crossbuf)
     evref[] = 0
     npath0 = length(raypath)
-    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q, guard, crossbuf, evref, rxr, hmax)
+    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q, guard, crossbuf, evref, rxr, hmax, knots)
     guard = zero(T)
     r, z, ξ, ζ, dt, qp, q = u[end]
     dD = svec[end]

@@ -113,13 +113,11 @@ end
   xloss = @inferred transmission_loss(pm, tx, rxs; mode=:incoherent)
   @test size(xloss) == (1001, 201)
   @test xloss[200,50] > 150
-  # reference values at the auto-nbeams default (cap raised 1000 → 4000) with
-  # the incoherent beam-width clamp (the old constants 71.1 / 76.6 were
-  # unconverged-in-beams artifacts); BELLHOP gives 75.69 at [100,100] — the
-  # remaining bias is the SSP-knot p-jump (issue #24, fixed in PR #26)
-  @test xloss[50,50] ≈ 70.64 atol=0.5
-  @test xloss[100,100] ≈ 74.32 atol=0.5
-end
+  # reference values at the auto-nbeams default (4000-beam cap) with the
+  # incoherent beam-width clamp and the knot transmission correction; BELLHOP
+  # (gaussian beams, incoherent) gives 71.22 and 75.69 dB respectively
+  @test xloss[50,50] ≈ 71.3 atol=0.5
+  @test xloss[100,100] ≈ 75.8 atol=0.5end
 
 @testitem "raysolver-backscatter" begin
   using UnderwaterAcoustics
@@ -350,13 +348,41 @@ end
     q, qfd = q_vs_raytube(env, -deg2rad(40))
     @test q ≈ qfd rtol=1e-3
     # curved bottom + soundspeed gradient (both corrections together); the SSP
-    # spans deeper than the bottom so that rays never cross the SSP knot, where
-    # the gradient discontinuity would need a (unimplemented) transmission
-    # correction to p that is unrelated to boundary reflections
+    # spans deeper than the bottom so that rays never cross an SSP knot
     env = UnderwaterEnvironment(bathymetry=ParabolicBathy(60.0, 50.0, 200.0),
       soundspeed=SampledField([1540.0, 1490.0]; z=[0.0, -75.0]), seabed=RigidBoundary)
     q, qfd = q_vs_raytube(env, -deg2rad(40))
     @test q ≈ qfd rtol=1e-3
+    # interior SSP knot inside the water column: rays crossing the gradient
+    # discontinuity need a transmission correction to p (issue #24)
+    env = UnderwaterEnvironment(bathymetry=60.0,
+      soundspeed=SampledField([1540.0, 1510.0, 1500.0]; z=[0.0, -30.0, -60.0]),
+      seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # edge knot: SSP sampled domain ends above the bottom, so the gradient
+    # drops to zero (flat extrapolation) at the last knot, which rays cross
+    # twice near the bottom bounce (the original issue #24 scenario)
+    env = UnderwaterEnvironment(bathymetry=ParabolicBathy(60.0, 50.0, 200.0),
+      soundspeed=SampledField([1540.0, 1506.7]; z=[0.0, -50.0]), seabed=RigidBoundary)
+    q, qfd = q_vs_raytube(env, -deg2rad(40))
+    @test q ≈ qfd rtol=1e-3
+    # eigenray amplitudes across an interior knot, checked against BELLHOP
+    # (AcousticsToolbox.jl, same environment; BELLHOP steps exactly onto SSP
+    # breakpoints, so it applies the knot transmission correctly). The SSP
+    # extends below the seafloor so that eigenray root-finding never evaluates
+    # the interpolant derivative at the edge of the sampled domain
+    env = UnderwaterEnvironment(bathymetry=60.0,
+      soundspeed=SampledField([1540.0, 1510.0, 1500.0]; z=[0.0, -30.0, -65.0]),
+      seabed=RigidBoundary)
+    pm = RaySolver(env)
+    arr = arrivals(pm, AcousticSource(0.0, -20.0, 5000.0), AcousticReceiver(100.0, -20.0))
+    bellhop_ref = [(0, 0, 0.0099578), (1, 0, 0.0088374), (0, 1, 0.0079438), (1, 1, 0.0064032)]
+    for (ns, nb, A) ∈ bellhop_ref
+      k = findfirst(a -> a.ns == ns && a.nb == nb, arr)
+      @test k !== nothing
+      @test abs(arr[k].ϕ) ≈ A rtol=5e-3
+    end
     # flat surface, soundspeed gradient (cn/cs jump terms, top reflection)
     env = UnderwaterEnvironment(bathymetry=200.0,
       soundspeed=SampledField([1540.0, 1500.0]; z=[0.0, -60.0]), seabed=RigidBoundary)
