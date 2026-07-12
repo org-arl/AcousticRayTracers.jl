@@ -57,9 +57,12 @@ Supported keyword arguments:
 - `ds`: nominal spacing between ray points (default: 1/10 water depth)
 - `atol`: absolute position tolerance (default: 0.0001 m)
 - `rugosity`: TODO (default: 1.5)
-- `min_amplitude`: minimum ray amplitude to track (default: 1e-5)
+- `min_amplitude`: minimum ray amplitude to track (default: 1e-6); rays weaker
+  than this (including absorption) stop being traced, which also culls weak
+  multipath from `arrivals` — set to `0.0` to keep all arrivals (e.g. for
+  impulse-response work)
 - `solver`: differential equation solver (default: nothing, auto)
-- `solver_tol`: solver tolerance (default: 1e-4)
+- `solver_tol`: solver tolerance (default: 1e-8)
 - `backscatter`: continue tracing rays that turn back toward the source (default: false)
 - `rmin`: left edge of modeling domain in m, ≤ 0 (default: 0; only meaningful with backscatter)
 - `rmax`: right edge of modeling domain in m (default: 0, auto = query range)
