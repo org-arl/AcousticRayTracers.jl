@@ -164,7 +164,10 @@ function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticS
     p1 = location(tx)
     R = abs(maximum(rxs.xrange) - p1[1])
     Δz = abs(Float64(rxs.zrange.step))
-    nbeams = clamp(ceil(Int, 8 * (pm.max_angle - pm.min_angle) * R / Δz), 100, 1000)
+    # cap was 1000, but benchmark convergence sweeps vs BELLHOP show deep-water
+    # grids need ~4000 beams (~0.04°/beam over a ±80° fan) to self-converge;
+    # BELLHOP's own auto uses 0.05° spacing
+    nbeams = clamp(ceil(Int, 8 * (pm.max_angle - pm.min_angle) * R / Δz), 100, 4000)
   end
   ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
