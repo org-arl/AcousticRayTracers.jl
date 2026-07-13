@@ -377,20 +377,29 @@ end
 # events: 1 = surface, 2 = bottom, 3 = max range, 4 = ray turned back (legacy) or
 # exited past the source (backscatter), 5 = scatterer hit, 6 = receiver range
 # crossing (recorded, not terminal), 6+k = crossing of the k-th soundspeed-
-# gradient discontinuity (transmission correction applied, not terminal). Inert
-# slots hold one(u[1]) so they never fire and preserve the element type (dual
-# numbers).
-function _check_ray!(out, u, s, integrator, a, b, rmax, rmin, backscatter, ss, δ, guard, r_rx, knots)
+# gradient discontinuity (transmission correction applied, not terminal),
+# 6+nk+m = crossing of the m-th boundary range-knot (no-op, not terminal: it
+# forces an integration step exactly at the knot so that a boundary vertex —
+# e.g. a seamount peak — cannot be straddled by a single step whose endpoints
+# are both in the water, which would let the ray tunnel through the feature).
+# Inert slots hold one(u[1]) so they never fire and preserve the element type
+# (dual numbers).
+function _check_ray!(out, u, s, integrator, a, b, rmax, rmin, backscatter, ss, δ, guard, r_rx, knots, rknots)
   out[1] = value(a, (u[1], 0.0, 0.0)) - u[2]    # surface reflection
   out[2] = u[2] + value(b, (u[1], 0.0, 0.0))    # bottom reflection
   out[3] = rmax - u[1]                          # maximum range
   out[4] = backscatter ? u[1] - rmin + δ : u[3] # exit domain left / ray turned back
   out[5] = ss === nothing || s < guard ? one(u[1]) : _mindist(ss, u[1], u[2]) - δ
   out[6] = isnan(r_rx) ? one(u[1]) : u[1] - r_rx
+  nk = 0
   if knots !== nothing
-    for k ∈ eachindex(knots.list)
+    nk = length(knots.list)
+    for k ∈ 1:nk
       out[6+k] = u[2] - knots.list[k][1]
     end
+  end
+  for m ∈ eachindex(rknots)
+    out[6+nk+m] = u[1] - rknots[m]
   end
 end
 
@@ -403,8 +412,12 @@ end
 # knot crossing (e.g. a bounce off a boundary at knot depth), the ray reflects
 # rather than transmits, so no correction is applied.
 function _ray_event!(i, ndx::Integer, crossbuf, evref, knots, a, b)
+  nk = knots === nothing ? 0 : length(knots.list)
   if ndx == 6
     push!(crossbuf, (i.t, i.u))
+  elseif ndx > 6 + nk
+    # boundary range-knot crossing: no action needed, the step landing here is
+    # the point (see _check_ray!)
   elseif ndx > 6
     _knot_jump!(i, knots.list[ndx-6], a, b, evref)
   else
@@ -414,6 +427,7 @@ function _ray_event!(i, ndx::Integer, crossbuf, evref, knots, a, b)
 end
 
 function _ray_event!(i, ndx::AbstractVector, crossbuf, evref, knots, a, b)
+  nk = knots === nothing ? 0 : length(knots.list)
   length(ndx) ≥ 6 && ndx[6] != 0 && push!(crossbuf, (i.t, i.u))
   for k ∈ 1:min(length(ndx), 5)
     if ndx[k] != 0
@@ -422,7 +436,7 @@ function _ray_event!(i, ndx::AbstractVector, crossbuf, evref, knots, a, b)
       return
     end
   end
-  for k ∈ 7:length(ndx)
+  for k ∈ 7:min(length(ndx), 6 + nk)
     ndx[k] != 0 && _knot_jump!(i, knots.list[k-6], a, b, evref)
   end
 end
@@ -454,6 +468,22 @@ function _gradient_discontinuities(env)
   end
   isempty(list) && return nothing
   (; list, κ=maximum(abs, slopes) / minimum(cs), cmax=maximum(cs))
+end
+
+# ranges at which the water-column boundaries have slope discontinuities
+# (interior sample points of piecewise-linear SampledField bathymetry or
+# altimetry). Used as no-op ray events so that an integration step cannot
+# straddle a boundary vertex (see _check_ray!). Returns an empty vector when
+# both boundaries are smooth in range.
+function _boundary_range_knots(env)
+  rknots = Float64[]
+  for fld ∈ (env.bathymetry, env.altimetry)
+    fld isa SampledFieldX || continue
+    fld.interp isa UnderwaterAcoustics.Linear || continue
+    xs = sort([Float64(x) for x ∈ fld.xrange])
+    append!(rknots, xs[2:end-1])
+  end
+  sort!(unique!(rknots))
 end
 
 # apply the transmission correction to the spreading rate p when a ray crosses a
@@ -535,7 +565,7 @@ function _nudge_off_knots(z0, θ, knots, εz)
   z0 + (sin(θ) < 0 ? -εz : εz) * one(z0)
 end
 
-function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax, knots)
+function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossbuf, evref, r_rx, hmax, knots, rknots)
   a = pm.env.altimetry
   b = pm.env.bathymetry
   ss = pm.scatterers
@@ -552,8 +582,8 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
   δ = one(T) * pm.atol
   nk = knots === nothing ? 0 : length(knots.list)
   cb = VectorContinuousCallback(
-    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, rmin, bs, ss, δ, guard, r_rx, knots),
-    (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref, knots, a, b), 6 + nk;
+    (out, u, s, i) -> _check_ray!(out, u, s, i, a, b, rmax, rmin, bs, ss, δ, guard, r_rx, knots, rknots),
+    (i, ndx) -> _ray_event!(i, ndx, crossbuf, evref, knots, a, b), 6 + nk + length(rknots);
     rootfind = true
   )
   if ss === nothing
@@ -647,11 +677,12 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   qp = one(T) / c₀      # spreading rate
   guard = zero(T)       # arc length over which scatterer detection is suppressed
   knots = _gradient_discontinuities(pm.env)
+  rknots = _boundary_range_knots(pm.env)
   while true
     empty!(crossbuf)
     evref[] = 0
     npath0 = length(raypath)
-    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q, guard, crossbuf, evref, rxr, hmax, knots)
+    svec, u = _trace_segment(T, prob, pm, p[1], p[3], θ, rmax, ds, qp, q, guard, crossbuf, evref, rxr, hmax, knots, rknots)
     guard = zero(T)
     r, z, ξ, ζ, dt, qp, q = u[end]
     dD = svec[end]
