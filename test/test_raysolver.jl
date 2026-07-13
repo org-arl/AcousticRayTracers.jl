@@ -433,18 +433,19 @@ end
   # not equivalent either: knot events fire only for SampledField, so the
   # generic fallback integrates blindly across the ∂c kinks and its geometry
   # does not converge with solver tolerance.
-  function exact_z(v::AbstractVector, zs, θ0, R)
+  function exact_z(v::AbstractVector, zs, θ0, R; z3=-21.0)   # z3: depth of the third SSP node
     T = promote_type(eltype(v), typeof(zs), typeof(θ0), typeof(R))
-    cz(z) = z ≥ -10 ? v[1] + (v[2] - v[1]) * z / -10 : v[2] + (v[3] - v[2]) * (z + 10) / -11
+    h2 = z3 + 10                         # (signed) thickness of the second layer
+    cz(z) = z ≥ -10 ? v[1] + (v[2] - v[1]) * z / -10 : v[2] + (v[3] - v[2]) * (z + 10) / h2
     zofc(c, layer) = layer == 1 ? -10 * (c - v[1]) / (v[2] - v[1]) :
-                                  -11 * (c - v[2]) / (v[3] - v[2]) - 10
+                                  h2 * (c - v[2]) / (v[3] - v[2]) - 10
     k = cos(θ0) / cz(T(zs))
     z = T(zs)
     u = T(sin(θ0))                       # sin of ray angle, positive up
     r = zero(T)
     for _ ∈ 1:100_000
       layer = z > -10 ? 1 : z < -10 ? 2 : (u < 0 ? 2 : 1)
-      g = layer == 1 ? (v[2] - v[1]) / -10 : (v[3] - v[2]) / -11
+      g = layer == 1 ? (v[2] - v[1]) / -10 : (v[3] - v[2]) / h2
       slope = -k * g                     # du/dr within the layer (circular arc)
       zb = u > 0 ? (layer == 1 ? zero(T) : T(-10)) :
                    (layer == 1 ? T(-10) : T(-20))
@@ -472,9 +473,9 @@ end
     end
     error("no convergence")
   end
-  function ℳ₃(v)
+  function ℳ₃(v; z3=-21.0)
     env = UnderwaterEnvironment(bathymetry = 20.0,
-      soundspeed = SampledField([v[1], v[2], v[3]]; z=[0.0, -10.0, -21.0]),
+      soundspeed = SampledField([v[1], v[2], v[3]]; z=[0.0, -10.0, z3]),
       seabed = SandySilt)
     pm = RaySolver(env)
     tx = AcousticSource((x=0.0, z=-5.0), 5000.0)
@@ -482,13 +483,34 @@ end
   end
   import AcousticRayTracers
   x = [1500.0, 1490.0, 1510.0]
-  # the SSP domain extends below the seafloor: with the last knot exactly at
-  # the bottom, Interpolations.jl errors on Dual-indexed evaluation at the
-  # domain edge (JuliaMath/Interpolations#645), and reflections there carry a
-  # small systematic geometry offset (issue #29)
+  # SSP domain extending below the seafloor
   @test ℳ₃(x) ≈ exact_z(x, -5.0, -deg2rad(30), 100.0) atol=1e-3
   g = gradient(ℳ₃, AutoForwardDiff(), x)
   ge = gradient(v -> exact_z(v, -5.0, -deg2rad(30), 100.0), AutoForwardDiff(), x)
+  @test g ≈ ge atol=1e-3
+  # last SSP knot exactly on the bottom (issue #29): reflections there used to
+  # pick up the Flat()-extrapolated ∂c = 0 and carry a systematic mm-scale
+  # geometry offset; the clamped in-domain evaluation must match the analytic
+  # trajectory, and (Interpolations.jl #645) must not trip on the domain edge
+  @test ℳ₃(x; z3=-20.0) ≈ exact_z(x, -5.0, -deg2rad(30), 100.0; z3=-20.0) atol=1e-3
+  g = gradient(v -> ℳ₃(v; z3=-20.0), AutoForwardDiff(), x)
+  ge = gradient(v -> exact_z(v, -5.0, -deg2rad(30), 100.0; z3=-20.0), AutoForwardDiff(), x)
+  @test g ≈ ge atol=1e-3
+  # knot whose gradient jump is zero in the primal but nonzero under
+  # perturbation of a sample value (issue #30): the below-seafloor node keeps
+  # the same slope as the last water-column segment, so the trajectory (and
+  # its exact gradient) match the z3=-20 edge-knot case, and the AD gradient
+  # must not pick up spurious knot-event sensitivities
+  function ℳ₄(v)
+    env = UnderwaterEnvironment(bathymetry = 20.0,
+      soundspeed = SampledField([v[1], v[2], v[3], v[3] + 2]; z=[0.0, -10.0, -20.0, -21.0]),
+      seabed = SandySilt)
+    pm = RaySolver(env)
+    tx = AcousticSource((x=0.0, z=-5.0), 5000.0)
+    AcousticRayTracers._trace(pm, tx, -deg2rad(30), 100.0)[1].path[end].z
+  end
+  @test ℳ₄(x) ≈ exact_z(x, -5.0, -deg2rad(30), 100.0; z3=-20.0) atol=1e-3
+  g = gradient(ℳ₄, AutoForwardDiff(), x)
   @test g ≈ ge atol=1e-3
 end
 
