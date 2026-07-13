@@ -338,6 +338,13 @@ end
 function _∂u((r, z, ξ, ζ, t, p, q), (c, ∂c, ∂²c), s)
   # implementation based on [COA (3.161-164, 3.58-63)]
   # assumes range-independent soundspeed
+  if isnan(ForwardDiff.value(z))
+    # a degenerate event rootfind can ask for the RHS at a NaN state; return
+    # NaN (instead of letting the SSP interpolant throw on a NaN index) so the
+    # solver aborts the segment gracefully
+    nan = convert(typeof(z), NaN)
+    return SA[nan, nan, nan, nan, nan, nan, nan]
+  end
   cᵥ = c(z)
   cᵥ² = cᵥ * cᵥ
   c̄ = ∂²c(z) * ξ * ξ

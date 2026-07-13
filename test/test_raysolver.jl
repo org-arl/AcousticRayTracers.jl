@@ -564,4 +564,16 @@ end
   @test length(arr) > 0
   x = acoustic_field(pm, tx, AcousticReceiverGrid2D(100.0:100.0:1000.0, -90.0:10.0:-10.0))
   @test all(isfinite, abs.(x))
+  # sibling case (issue #32): the SSP minimum sits exactly on the −50 knot, so
+  # rays from the on-knot source turn exactly at the knot; a degenerate event
+  # rootfind there used to abort the whole solve (dt → 0 / NaN state)
+  env2 = UnderwaterEnvironment(
+    bathymetry = 90.0,
+    soundspeed = SampledField([1500.0, 1490.0, 1495.0]; z=[0.0, -50.0, -100.0]),
+    seabed = RigidBoundary
+  )
+  pm2 = RaySolver(env2)
+  arr2 = arrivals(pm2, tx, AcousticReceiver(1000.0, -20.0); paths=false)
+  @test length(arr2) > 0
+  @test all(isfinite(a.t) && isfinite(abs(a.ϕ)) for a ∈ arr2)
 end
