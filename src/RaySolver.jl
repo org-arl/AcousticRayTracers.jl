@@ -485,9 +485,31 @@ end
 
 # prepare to trace a ray segment
 function _prepare_trace(T, pm)
-  c = z -> value(pm.env.soundspeed, z)
-  ∂c = z -> ∂(pm.env.soundspeed, z, :z)
-  ∂²c = z -> ∂(pm.env.soundspeed, z, :z, :z)
+  ss = pm.env.soundspeed
+  if ss isa SampledFieldZ && ss.interp isa UnderwaterAcoustics.Linear
+    # where the water column does not extend beyond the sampled domain, evaluate
+    # strictly inside the domain and continue the end segment linearly past its
+    # edge: the field's flat extrapolation zeroes ∂c at/outside the outermost
+    # knots, and when the bathymetry coincides with the last knot this biases
+    # the curvature of every bottom-reflected ray (issue #29); clamping also
+    # avoids Dual-indexed evaluation exactly at the domain edge
+    # (Interpolations.jl #645). Where the water column extends beyond the
+    # domain, the flat-extrapolated region is genuinely reachable and is left
+    # untouched (the edge knot is then handled as a gradient discontinuity).
+    z1, z2 = Float64.(extrema(ss.zrange))
+    zlo = z1 ≤ -maximum(pm.env.bathymetry) + 1e-3 ? z1 + 1e-6 : -Inf
+    zhi = z2 ≥ minimum(pm.env.altimetry) - 1e-3 ? z2 - 1e-6 : Inf
+    c = z -> begin
+      zc = clamp(z, zlo, zhi)
+      value(ss, zc) + ∂(ss, zc, :z) * (z - zc)
+    end
+    ∂c = z -> ∂(ss, clamp(z, zlo, zhi), :z)
+    ∂²c = z -> ∂(ss, clamp(z, zlo, zhi), :z, :z)
+  else
+    c = z -> value(ss, z)
+    ∂c = z -> ∂(ss, z, :z)
+    ∂²c = z -> ∂(ss, z, :z, :z)
+  end
   ODEProblem{false}(_∂u, zeros(SVector{7,T}), (zero(T), one(T)), (c, ∂c, ∂²c))
 end
 
@@ -519,7 +541,7 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
   ss = pm.scatterers
   bs = pm.backscatter
   z0 = _nudge_off_knots(z0, θ, knots, 1e-3 * pm.atol)
-  cᵥ = value(pm.env.soundspeed, z0)
+  cᵥ = prob.p[1](z0)
   u0 = SA[convert(T, r0), z0, cos(θ)/cᵥ, sin(θ)/cᵥ, zero(T), p0, q0]
   # legacy tspan formula assumes forward-going rays (|θ| < π/2); with backscatter
   # or scatterers, use a geometry-based bound instead (segments end at events)
@@ -559,10 +581,13 @@ function _trace_segment(T, prob, pm, r0, z0, θ, rmax, ds, p0, q0, guard, crossb
       end; safety_factor=9//10, cached_dtcache=zero(T))
     cbs = CallbackSet(klimiter, cbs)
   end
+  # reltol must track solver_tol: the ODE-solver default (1e-3) would dominate
+  # abstol for states of O(10+) (depths, ranges) and leave a mm-scale geometry
+  # error floor that no abstol can remove
   if ds ≤ 0
-    soln = solve(prob, pm.solver; abstol=pm.solver_tol, save_everystep=false, callback=cbs)
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, reltol=pm.solver_tol, save_everystep=false, callback=cbs)
   else
-    soln = solve(prob, pm.solver; abstol=pm.solver_tol, saveat=ds, callback=cbs)
+    soln = solve(prob, pm.solver; abstol=pm.solver_tol, reltol=pm.solver_tol, saveat=ds, callback=cbs)
   end
   (soln.t, soln.u)
 end
@@ -602,7 +627,6 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   zmin = -hmax
   ϵ = one(zmin) * pm.solver_tol
   p = location(tx1)
-  c₀ = value(pm.env.soundspeed, p)
   T = promote_type(env_type(pm.env), eltype(p), typeof(f), typeof(θ), typeof(rmax), _scat_eltype(pm.scatterers))
   raypath = Array{@NamedTuple{x::T,y::T,z::T}}(undef, 0)
   aux_info = Array{Tuple{T,T,T,Complex{T}}}(undef, 0)
@@ -611,6 +635,8 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   evref = Ref(0)
   rxr = convert(T, r_rx)
   prob = _prepare_trace(T, pm)
+  cf, ∂cf, _ = prob.p    # domain-safe soundspeed and gradient (see _prepare_trace)
+  c₀ = cf(p.z)
   A = one(Complex{T})   # phasor
   s = 0                 # surface bounces
   b = 0                 # bottom bounces
@@ -676,35 +702,35 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
       θ = atan(t̂′[2], t̂′[1])
       sinθg = clamp(abs(dp), zero(dp), one(dp))
       ρ = value(pm.env.density, (r, 0.0, z))
-      c = value(pm.env.soundspeed, (r, 0.0, z))
+      c = cf(z)
       A *= reflection_coef(sca.boundary, f, asin(sinθg), ρ, c)
-      gz = ∂(pm.env.soundspeed, z, :z)
+      gz = ∂cf(z)
       qp = _reflect_pq(qp, q, c, t̂, n̂, hit.curvature, SA[zero(gz), gz])
       guard = 2 * one(T) * pm.atol
     elseif ev == 1 && isapprox(z, zmax; atol=1e-3)   # hit the surface
       s += 1
       ρ = value(pm.env.density, (r, 0.0, 0.0))
-      c = value(pm.env.soundspeed, (r, 0.0, 0.0))
+      c = cf(zero(z))
       A *= reflection_coef(pm.env.surface, f, π/2 - θ, ρ, c)
       a′ = ∂(pm.env.altimetry, (r, 0.0, 0.0), :x)
       a″ = ∂(pm.env.altimetry, (r, 0.0, 0.0), :x, :x)
       m = √(1 + a′^2)
       κ = a″ / m^3                       # positive: boundary convex into the water
       n̂ = SA[a′, -one(a′)] / m           # unit normal pointing into the water
-      gz = ∂(pm.env.soundspeed, z, :z)
+      gz = ∂cf(z)
       qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
       θ = -θ + 2atan(a′)
     elseif ev == 2 && isapprox(z, zmin; atol=1e-3)   # hit the bottom
       b += 1
       ρ = value(pm.env.density, (r, 0.0, z))
-      c = value(pm.env.soundspeed, (r, 0.0, z))
+      c = cf(z)
       A *= reflection_coef(pm.env.seabed, f, π/2 + θ, ρ, c)
       d′ = ∂(pm.env.bathymetry, (r, 0.0, 0.0), :x)
       d″ = ∂(pm.env.bathymetry, (r, 0.0, 0.0), :x, :x)
       m = √(1 + d′^2)
       κ = d″ / m^3                       # positive: boundary convex into the water
       n̂ = SA[d′, one(d′)] / m            # unit normal pointing into the water
-      gz = ∂(pm.env.soundspeed, z, :z)
+      gz = ∂cf(z)
       qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
       θ = -θ - 2atan(d′)
     else
@@ -717,7 +743,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
       abs(A)/abs(q) < pm.min_amplitude && break
     end
   end
-  cₛ = value(pm.env.soundspeed, p)
+  cₛ = cf(p[3])
   A *= √abs(cₛ * cos(θ₀) / (p[1] * c₀ * q))                   # [COA (3.65)]
   A *= absorption(f, D, pm.env.salinity, mid_temp, -zmin/2)   # nominal absorption
   RayArrival(t, A, s, b, θ₀, -θ, raypath), aux_info, crossings
