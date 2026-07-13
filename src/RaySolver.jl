@@ -90,56 +90,26 @@ function UnderwaterAcoustics.arrivals(pm::RaySolver, tx::AbstractAcousticSource,
   p2 = location(rx)
   p1 = location(tx)
   R = abs(p2.x - p1.x)
-  # the interval root-solve tolerance is in launch-angle space, but eigenrays are
-  # accepted on the depth residual (ztol, in m); since dΔz/dθ grows ∝ range, the
-  # angle tolerance must shrink ∝ 1/range or all roots at long range carry
-  # residuals ≫ ztol and are rejected
-  θtol = pm.atol / max(ForwardDiff.value(R), 1.0)   # plain float: solver control, not differentiated
   nbeams = pm.nbeams
   if nbeams == 0
     h = maximum(pm.env.bathymetry)
     nbeams = ceil(Int, 16 * (pm.max_angle - pm.min_angle) / atan(h, R))
   end
   ds = pm.ds ≤ 0 ? minimum(pm.env.bathymetry) / 10 : pm.ds
-  ntasks = _ntasks(pm)
   θ = range(pm.min_angle, pm.max_angle; length=nbeams)
-  rays = _tmap(θ1 -> _trace(pm, tx, θ1, p2.x)[1], θ, ntasks)
-  err = map(rays) do ray
-    p3 = ray.path[end]
-    isapprox(p3.x, p2.x; atol=pm.atol) && isapprox(p3.y, p2.y; atol=pm.atol) ? p3.z - p2.z : NaN
-  end
+  # eigenrays are found from receiver-range crossings grouped by bounce
+  # signature (_fan_search): with range-dependent bathymetry, adjacent fan rays
+  # can follow different bounce histories (e.g. hit or clear an obstacle), so
+  # the raw depth error Δz(θ) is discontinuous and brackets across a signature
+  # change are meaningless; within one signature Δz(θ) is continuous. Using
+  # crossings (rather than ray endpoints) also finds arrivals on rays that
+  # refract back down-range after passing the receiver.
+  rdom = p2.x + 0.1   # trace slightly past rx so the range crossing is recorded before termination
   T1 = promote_type(env_type(pm.env), eltype(location(tx)), typeof(p2.x), typeof(p2.z))
-  T2 = T1 == eltype(θ) ? eltype(rays) : typeof(_trace(pm, tx, T1(θ[1]), p2.x; paths)[1])
-  prob1 = IntervalNonlinearProblem{false}(_Δz, T1.((θ[1], θ[1])), (pm, tx, p2.x, p2.z))
-  prob2 = NonlinearProblem{false}(_Δz, T1(θ[1]), (pm, tx, p2.x, p2.z))
-  erays = Vector{T2}[T2[] for _ ∈ 1:length(θ)]
-  _tforeach(length(θ), ntasks) do i
-    if isapprox(err[i], 0; atol=pm.atol)
-      # ray already at receiver
-      v = T1 == eltype(θ) ? rays[i] : _trace(pm, tx, T1(θ[i]), p2.x; paths)[1]
-      push!(erays[i], v)
-    elseif i > 1 && !isnan(err[i-1]) && !isnan(err[i]) && sign(err[i-1]) * sign(err[i]) < 0
-      # rays bracket the receiver, so find a root in between...
-      soln = solve(remake(prob1; tspan=T1.(_ordered(θ[i-1], θ[i]))); abstol=θtol)
-      if successful_retcode(soln.retcode) && abs(soln.resid) < ztol
-        push!(erays[i], _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
-      end
-    elseif i > 2 && _isnearzero(err[i-2], err[i-1], err[i])
-      # at a turning point, so potentially two roots between i-2 and i, try and find both...
-      lims = _ordered(θ[i-2], θ[i])
-      soln = solve(remake(prob2; u0=T1(θ[i-1])); abstol=pm.atol)
-      if successful_retcode(soln.retcode) && abs(soln.resid) < ztol && lims[1] < soln.u < lims[2]
-        θ₁ = soln.u
-        push!(erays[i], _trace(pm, tx, θ₁, p2.x, ds; paths)[1])
-        soln = solve(remake(prob2; u0=T1(θ[i-1] < θ₁ ? lims[2] : lims[1])); abstol=pm.atol)
-        if successful_retcode(soln.retcode) && abs(soln.resid) < ztol &&
-           (θ[i-1] < θ₁ ? θ₁ < soln.u < lims[2] : lims[1] < soln.u < θ₁)
-          push!(erays[i], _trace(pm, tx, soln.u, p2.x, ds; paths)[1])
-        end
-      end
-    end
-  end
-  sort!(reduce(vcat, erays); by=Base.Fix2(getfield, :t))
+  T2 = typeof(RayArrival(zero(T1), zero(Complex{T1}), 0, 0, zero(T1), zero(T1),
+    Array{@NamedTuple{x::T1,y::T1,z::T1}}(undef, 0)))
+  erays = _fan_search(T2, pm, tx, collect(T1, θ), T1(rdom), T1(p2.x), T1(p2.z), ds, ztol, paths; edges=true)
+  sort!(erays; by=Base.Fix2(getfield, :t))
 end
 
 function UnderwaterAcoustics.acoustic_field(pm::RaySolver, tx::AbstractAcousticSource, rx::AbstractAcousticReceiver; mode=:coherent)
@@ -780,9 +750,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
   RayArrival(t, A, s, b, θ₀, -θ, raypath), aux_info, crossings
 end
 
-_Δz(ϕ, (pm, tx1, rmax, z)) = _trace(pm, tx1, ϕ, rmax)[1].path[end].z - z
-
-### backscatter eigenray search
+### eigenray search (signature-grouped; used by both forward and backscatter paths)
 
 # crossings are grouped by "signature" — direction of travel + bounce history —
 # so that the depth error Δz(θ) restricted to one signature is continuous in θ
@@ -813,8 +781,15 @@ function _findsig(crossings, sig)
   nothing
 end
 
-# depth error at the receiver range for the crossing matching sig
+# depth error at the receiver range for the crossing matching sig; NaN when the
+# launch angle is outside the fan (a diverging Newton iteration can probe
+# arbitrary angles, and without backscatter a beyond-vertical angle would give a
+# negative integration span)
 function _Δz_sig(ϕ, (pm, tx1, rdom, r_rx, z, sig))
+  ϕv = ForwardDiff.value(ϕ)
+  if !(pm.backscatter ? -π ≤ ϕv ≤ π : abs(ϕv) < π/2)
+    return convert(promote_type(typeof(ϕ), typeof(z)), NaN)
+  end
   crs = _trace(pm, tx1, ϕ, rdom; paths=false, r_rx)[3]
   i = _findsig(crs, sig)
   i === nothing ? convert(promote_type(typeof(ϕ), typeof(z)), NaN) : crs[i].z - z
@@ -863,10 +838,19 @@ end
 
 # eigenray search over one launch-angle fan: find receiver-range crossings for
 # each launch angle, group by signature, and root-find on the per-signature
-# depth error using the same 3-way logic as the forward eigenray search
-function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths) where T2
+# depth error (exact roots, brackets, and near-turning-point double roots).
+# With edges=true, signature support edges are additionally refined by
+# bisection (issue #31: recovers families whose roots hide between the last
+# supported fan sample and the tangency angle behind a blocking feature); off
+# for backscatter, where the near-tangent grazing arrivals it recovers make
+# the echo field noisy w.r.t. scatterer geometry.
+function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, rdom, r_rx, zrx, ds, ztol, paths; edges=false) where T2
   T1 = eltype(θ)
-  θtol = pm.atol / max(ForwardDiff.value(abs(r_rx)), 1.0)   # see arrivals: angle tol scales ∝ 1/range
+  # the interval root-solve tolerance is in launch-angle space, but eigenrays are
+  # accepted on the depth residual (ztol, in m); since dΔz/dθ grows ∝ range, the
+  # angle tolerance must shrink ∝ 1/range or all roots at long range carry
+  # residuals ≫ ztol and are rejected
+  θtol = pm.atol / max(ForwardDiff.value(abs(r_rx)), 1.0)   # plain float: solver control, not differentiated
   ntasks = _ntasks(pm)
   crs_all = _tmap(θ1 -> _trace(pm, tx, θ1, rdom; paths=false, r_rx)[3], θ, ntasks)
   allsigs = Set{NTuple{5,Int}}()
@@ -908,8 +892,88 @@ function _fan_search(::Type{T2}, pm::RaySolver, tx::AbstractAcousticSource, θ, 
           end
         end
       end
+      # support-edge refinement: a signature's θ-support ends where the ray
+      # family becomes tangent to a blocking feature; a root can hide between
+      # the last supported fan sample and that tangency angle (with no second
+      # sample to bracket it). Bisect toward the edge, and root-find on any
+      # sign change encountered on the way.
+      if edges && !isnan(err[i]) && !isapprox(err[i], 0; atol=pm.atol)
+        for j ∈ (i-1, i+1)
+          1 ≤ j ≤ length(θ) && isnan(err[j]) || continue
+          θr = _edge_root(θ[i], θ[j], err[i], θtol, (pm, tx, rdom, r_rx, zrx, sig), ztol)
+          if θr !== nothing
+            v = _crossing_arrival(pm, tx, θr, rdom, r_rx, sig, ds; paths)
+            v === nothing || push!(results[i], v)
+          end
+        end
+      end
     end
     foreach(r -> append!(erays, r), results)
   end
   erays
+end
+
+# bisect from a supported launch angle θa toward an unsupported one θb (where
+# the signature is absent) and return a root of the per-signature depth error
+# if a sign change is found before the support edge; nothing otherwise. The
+# θ-support of a signature can be porous near tangency (a grazing ray's
+# hit/miss of the blocking feature flips with integration noise), which
+# defeats the standard bracketing solvers, so the search runs a NaN-aware
+# bisection on primal values; for dual-numbered inputs the root's derivatives
+# are then restored via the implicit function theorem (matching what
+# NonlinearSolve does for a clean bracket).
+function _edge_root(θa, θb, fa, θtol, params, ztol)
+  pf = ϕ -> ForwardDiff.value(_Δz_sig(ϕ, params))
+  lo, hi = ForwardDiff.value(θa), ForwardDiff.value(θb)
+  flo = ForwardDiff.value(fa)
+  found = false
+  local θ2, f2
+  while abs(hi - lo) > θtol
+    m = (lo + hi) / 2
+    fm = pf(m)
+    if isnan(fm)
+      hi = m
+    elseif sign(fm) * sign(flo) < 0
+      θ2, f2 = m, fm
+      found = true
+      break
+    else
+      lo = m
+    end
+  end
+  found || return nothing
+  θ1, f1 = lo, flo
+  # NaN-aware bisection on [θ1, θ2]; NaN midpoints are replaced by a nearby
+  # supported angle (probes at ±j/20 of the interval), so a porous support
+  # only slows the shrink instead of killing it
+  while abs(θ2 - θ1) > θtol
+    m = (θ1 + θ2) / 2
+    fm = pf(m)
+    if isnan(fm)
+      ok = false
+      for j ∈ 1:9, s ∈ (1.0, -1.0)
+        x = m + s * j / 20 * (θ2 - θ1)
+        fx = pf(x)
+        isnan(fx) && continue
+        m, fm = x, fx
+        ok = true
+        break
+      end
+      ok || break
+    end
+    if sign(fm) == sign(f1)
+      θ1, f1 = m, fm
+    else
+      θ2, f2 = m, fm
+    end
+  end
+  θr, fr = abs(f1) < abs(f2) ? (θ1, f1) : (θ2, f2)
+  abs(fr) < ztol || return nothing
+  T1 = typeof(θa)
+  T1 <: ForwardDiff.Dual || return θr
+  # implicit function theorem: dθ*/dp = -(∂f/∂p) / (∂f/∂θ) at the root
+  slope = (f2 - f1) / (θ2 - θ1)
+  fD = _Δz_sig(convert(T1, θr), params)
+  isnan(ForwardDiff.value(fD)) && return convert(T1, θr)
+  convert(T1, θr) - (fD - ForwardDiff.value(fD)) / slope
 end
