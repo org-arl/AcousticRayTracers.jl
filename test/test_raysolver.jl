@@ -119,6 +119,37 @@ end
   @test xloss[50,50] ≈ 71.3 atol=0.5
   @test xloss[100,100] ≈ 75.8 atol=0.5end
 
+@testitem "raysolver-eigenrays-blocked" begin
+  # eigenray search behind blocking bathymetry (issue #31): adjacent fan rays
+  # alternately hit or clear the seamount, so the raw depth error Δz(θ) is
+  # discontinuous; the signature-grouped search must still find the multipath
+  # families that make it past the seamount, stably across fan resolutions
+  # (near-tangent skimming paths remain resolution-dependent and are not
+  # asserted). A receiver deep in the geometric shadow sees only steep
+  # multiple-bounce paths; a shallow receiver sees several families.
+  using UnderwaterAcoustics
+  bathy = SampledField([3000, 3000, 500, 3000, 3000]; x=[0, 10e3, 20e3, 30e3, 50e3])
+  env = UnderwaterEnvironment(bathymetry=bathy, soundspeed=1500.0,
+    seabed=FluidBoundary(1.5*water_density(), 1550.0, dBperλ(0.5)))
+  tx = AcousticSource((x=0, z=-18), 230.0)
+  rx = AcousticReceiver(40e3, -1500.0)
+  for nb ∈ (537, 2000)
+    pm = RaySolver(env; min_angle=-80°, max_angle=80°, nbeams=nb)
+    arr = arrivals(pm, tx, rx)
+    @test length(arr) ≥ 2
+    sigs = [(a.ns, a.nb) for a ∈ arr]
+    @test (1, 3) ∈ sigs && (2, 3) ∈ sigs
+    @test all(abs(a.path[end].z - (-1500)) < 0.5 for a ∈ arr)
+    @test all(abs(a.path[end].x - 40e3) < 0.5 for a ∈ arr)
+    i = findfirst(==((1, 3)), sigs)
+    @test arr[i].t ≈ 27.612 atol=1e-3
+  end
+  # shallow receiver: multiple families through the 500 m gap
+  pm = RaySolver(env; min_angle=-80°, max_angle=80°, nbeams=2000)
+  arr = arrivals(pm, tx, AcousticReceiver(40e3, -200.0))
+  @test length(arr) ≥ 5
+end
+
 @testitem "raysolver-backscatter" begin
   using UnderwaterAcoustics
   # null test: with nothing to backscatter, arrivals match the default solver
