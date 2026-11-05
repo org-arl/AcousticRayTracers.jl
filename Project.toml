@@ -1,6 +1,6 @@
 name = "AcousticRayTracers"
 uuid = "4fc4fbda-03ee-4929-b565-b3d9b12bdf79"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Mandar Chitre <mandar@nus.edu.sg>"]
 
 [deps]
@@ -23,5 +23,5 @@ OrdinaryDiffEq = "7"
 OrdinaryDiffEqRosenbrock = "2.1.0"
 SciMLBase = "3.11.0"
 StaticArrays = "1.9.18"
-UnderwaterAcoustics = "0.8"
+UnderwaterAcoustics = "0.8,0.9"
 julia = "1.10"
