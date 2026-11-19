@@ -503,8 +503,12 @@ function _prepare_trace(T, pm)
     # (Interpolations.jl #645). Where the water column extends beyond the
     # domain, the flat-extrapolated region is genuinely reachable and is left
     # untouched (the edge knot is then handled as a gradient discontinuity).
+    # Where the domain extends below the deepest seabed, the clamp sits at the
+    # seabed instead, so that integration steps overshooting the bottom do not
+    # see the slope of a sub-seabed segment (knot on the seabed, issue #34)
     z1, z2 = Float64.(extrema(ss.zrange))
-    zlo = z1 ≤ -maximum(pm.env.bathymetry) + 1e-3 ? z1 + 1e-6 : -Inf
+    zb = -ForwardDiff.value(maximum(pm.env.bathymetry))   # plain float: clamp position, not differentiated
+    zlo = z1 ≤ zb + 1e-3 ? max(z1, zb) + 1e-6 : -Inf
     zhi = z2 ≥ minimum(pm.env.altimetry) - 1e-3 ? z2 - 1e-6 : Inf
     c = z -> begin
       zc = clamp(z, zlo, zhi)
@@ -621,6 +625,11 @@ function _reflect_pq(qp, q, c, t̂, n̂, κ, gc)
   qp + q * RN
 end
 
+# soundspeed gradient ∂c/∂z at boundary depth zb, taken just inside the water
+# (n̂z: vertical component of the into-water normal); at an SSP knot on the
+# boundary, ∂ would return the mean of the water-side and beyond-boundary slopes
+_water_side_gradient(∂c, zb, n̂z) = ∂c(zb + 1e-6 * sign(n̂z))
+
 # trace a ray starting at tx1 with angle θ until it reaches rmax. ds controls the
 # spacing of points along the ray. If paths=true, also returns the ray path as a
 # vector of (x, y, z) points. If aux=true, also returns auxiliary info as a vector
@@ -725,7 +734,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
       m = √(1 + a′^2)
       κ = a″ / m^3                       # positive: boundary convex into the water
       n̂ = SA[a′, -one(a′)] / m           # unit normal pointing into the water
-      gz = ∂cf(z)
+      gz = _water_side_gradient(∂cf, zmax, n̂[2])
       qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
       θ = -θ + 2atan(a′)
     elseif ev == 2 && isapprox(z, zmin; atol=1e-3)   # hit the bottom
@@ -738,7 +747,7 @@ function _trace(pm::RaySolver, tx1::AbstractAcousticSource, θ, rmax, ds=0.0; pa
       m = √(1 + d′^2)
       κ = d″ / m^3                       # positive: boundary convex into the water
       n̂ = SA[d′, one(d′)] / m            # unit normal pointing into the water
-      gz = ∂cf(z)
+      gz = _water_side_gradient(∂cf, zmin, n̂[2])
       qp = _reflect_pq(qp, q, c, SA[cos(θ), sin(θ)], n̂, κ, SA[zero(gz), gz])
       θ = -θ - 2atan(d′)
     else
